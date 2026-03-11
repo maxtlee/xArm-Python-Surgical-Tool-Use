@@ -1,3 +1,6 @@
+# Sytem dependencies 
+# sudo apt install portaudio19-dev python3-tk
+
 xarm-python-sdk
 SpeechRecognition  
 pyaudio  

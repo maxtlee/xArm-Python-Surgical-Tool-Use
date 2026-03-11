@@ -1,3 +1,46 @@
+# xArm-Python-Surgical-Tool-Use
+
+Using the xArm and DexKit hands to operate as a tool-using and voice-commanded assistant for hand surgeons 
+
+Project as a part of Carnegie Mellon Foam Robotics Lab
+
+## Setup
+
+1. Clone this repository
+```bash
+    git clone https://github.com/maxtlee/xArm-Python-Surgical-Tool-Use.git
+    cd xArm-Python-Surgical-Tool-Use
+```
+
+2. Install packages
+
+Linux/Mac (Python 3 required)
+```bash
+    sudo apt install portaudio19-dev python3-tk
+    python3 -m venv venv
+    pip install -r requirements.txt
+```
+
+Windows
+```bash
+    jump off a building
+```
+
+3. Connect to ur xArm
+
+Plug into ethernet, turn xArm on, and change network (IPv4) static address as follows:
+
+IP: 192.168.1.50 
+
+Netmask: 255.255.255.0
+
+4. Run code
+```bash
+    python3 surgical_test/voice-movement.py
+```
+Change robot IP to 192.168.1.195
+Do fun stuff
+
 # xArm-Python-SDK
 
 [![PyPI Downloads](https://static.pepy.tech/badge/xarm-python-sdk)](https://pepy.tech/projects/xarm-python-sdk)
