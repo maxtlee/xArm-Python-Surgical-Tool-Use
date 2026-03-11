@@ -12,34 +12,59 @@ Project as a part of Carnegie Mellon Foam Robotics Lab
     cd xArm-Python-Surgical-Tool-Use
 ```
 
-2. Install packages
+2. Install packages (Python 3 required)
 
-Linux/Mac (Python 3 required)
+Linux/Mac
 ```bash
     sudo apt install portaudio19-dev python3-tk
     python3 -m venv venv
+    source venv/bin/activate
     pip install -r requirements.txt
 ```
 
-Windows
+Windows (CMD)
+
+Tkinter is bundled with the standard Python installer (ensure "tcl/tk and IDLE" is checked). PyAudio installs via pip without a separate PortAudio download. You might also need to install C++. 
 ```bash
-    jump off a building
+    python3 -m venv venv
+    .\venv\Scripts\activate.bat
+    pip install -r requirements.txt
 ```
 
-3. Connect to ur xArm
+Windows (PowerShell)
 
-Plug into ethernet, turn xArm on, and change network (IPv4) static address as follows:
+Tkinter is bundled with the standard Python installer (ensure "tcl/tk and IDLE" is checked). PyAudio installs via pip without a separate PortAudio download. You might also need to install C++. 
+```bash
+    python3 -m venv venv
+    .\venv\Scripts\Activate.ps1
+    pip install -r requirements.txt
+```
 
-IP: 192.168.1.50 
+3. Connect to the xArm
 
-Netmask: 255.255.255.0
+Plug in via ethernet and power on the xArm. Set your host machine's wired network adapter to a **static IPv4** address on the same subnet as the robot:
 
-4. Run code
+| Field   | Value           |
+|---------|-----------------|
+| IP      | 192.168.1.50    |
+| Netmask | 255.255.255.0   |
+| Gateway | 192.168.1.1     |
+
+The robot's default IP is **192.168.1.195**. Verify connectivity with `ping 192.168.1.195`. 
+
+5. Run the voice-control app
 ```bash
     python3 surgical_test/voice-movement.py
 ```
-Change robot IP to 192.168.1.195
-Do fun stuff
+
+A GUI window will open. Click **Connect** (the IP is pre-filled from `robot.conf`), then **Start Listening**. Speak commands to move individual joints or send the arm home:
+
+| Voice command              | Action                    |
+|----------------------------|---------------------------|
+| "joint one/two/.../seven up"   | Move that joint +20°  |
+| "joint one/two/.../seven down" | Move that joint −20°  |
+| "go home"                  | Return to home position   |
+| "stop"                     | Emergency stop            |
 
 # xArm-Python-SDK
 
