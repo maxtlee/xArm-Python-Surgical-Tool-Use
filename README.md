@@ -2,7 +2,9 @@
 
 Using the xArm and DexKit hands to operate as a tool-using and voice-commanded assistant for hand surgeons 
 
-Project as a part of Carnegie Mellon Foam Robotics Lab
+Project funded by Carnegie Mellon Foam Robotics Lab and advised by Dr. Nancy Pollard
+
+Forked from https://github.com/xArm-Developer/xArm-Python-SDK.git
 
 ## Setup
 
@@ -24,7 +26,7 @@ Linux/Mac
 
 Windows (CMD)
 
-Tkinter is bundled with the standard Python installer (ensure "tcl/tk and IDLE" is checked). PyAudio installs via pip without a separate PortAudio download. You might also need to install C++. 
+Tkinter is bundled with the standard Python installer (ensure "tcl/tk and IDLE" is checked). PyAudio installs via pip without a separate PortAudio download. You might also need to install C++. Python 3.11 is needed. You also probably need to upgrade pip
 ```bash
     python3 -m venv venv
     .\venv\Scripts\activate.bat
@@ -33,7 +35,7 @@ Tkinter is bundled with the standard Python installer (ensure "tcl/tk and IDLE" 
 
 Windows (PowerShell)
 
-Tkinter is bundled with the standard Python installer (ensure "tcl/tk and IDLE" is checked). PyAudio installs via pip without a separate PortAudio download. You might also need to install C++. 
+Tkinter is bundled with the standard Python installer (ensure "tcl/tk and IDLE" is checked). PyAudio installs via pip without a separate PortAudio download. You might also need to install C++. Python 3.11 is needed. You also probably need to upgrade pip
 ```bash
     python3 -m venv venv
     .\venv\Scripts\Activate.ps1
