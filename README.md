@@ -50,7 +50,6 @@ Plug in via ethernet and power on the xArm. Set your host machine's wired networ
 |---------|-----------------|
 | IP      | 192.168.1.50    |
 | Netmask | 255.255.255.0   |
-| Gateway | 192.168.1.1     |
 
 The robot's default IP is **192.168.1.195**. Verify connectivity with `ping 192.168.1.195`. 
 
