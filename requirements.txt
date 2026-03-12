@@ -4,3 +4,7 @@
 xarm-python-sdk
 SpeechRecognition  
 pyaudio  
+PyQt5
+pyserial
+pyyaml
+dynamixel_sdk
