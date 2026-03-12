@@ -67,6 +67,71 @@ A GUI window will open. Click **Connect** (the IP is pre-filled from `robot.conf
 | "go home"                  | Return to home position   |
 | "stop"                     | Emergency stop            |
 
+## Simulation modes
+
+The system supports three simulation layers, controlled by `surgical.conf`:
+
+### Mock (no dependencies beyond base install)
+Set `mode = mock` in `surgical.conf`. All commands print to console.
+No display required. Good for CI and logic testing.
+
+```bash
+python surgical_test/voice-movement.py
+```
+
+### MuJoCo 3D simulation (recommended for local development)
+Install MuJoCo, then run:
+
+**Unix/Linux/Mac:**
+```bash
+pip install mujoco mediapy
+bash scripts/fetch_xarm_urdf.sh    # downloads xArm6 URDF + meshes
+python scripts/urdf_to_mjcf.py     # optional: converts to MJCF
+```
+
+**Windows:**
+```bash
+pip install mujoco mediapy
+scripts\fetch_xarm_urdf.bat        # downloads xArm6 URDF + meshes
+python scripts\urdf_to_mjcf.py     # optional: converts to MJCF
+```
+
+Set `mode = mujoco` and `vis_mode = viewer` in `surgical.conf`.
+
+```bash
+python surgical_test/voice-movement.py
+```
+
+A 3D window opens showing the xArm, the soft foam hand (flexcomp), and the
+deformable tissue surface. Foam hand ↔ tissue contact forces are computed by
+MuJoCo's unified contact engine and printed to the console.
+
+For headless rendering (no display, exports mp4):
+
+```
+Set vis_mode = headless in surgical.conf
+```
+
+For browser-based 3D view:
+
+```bash
+pip install meshcat
+# Set vis_mode = meshcat in surgical.conf
+# Opens at http://localhost:7000
+```
+
+### Real hardware (lab only)
+Set `mode = real` in `surgical.conf`. Connect xArm via Ethernet and foam hand
+via USB serial. See the connection setup section above for network configuration.
+
+## Foam hand CAD → simulation
+
+To add accurate foam hand geometry to the simulation:
+- SolidWorks: use sw_urdf_exporter, then reference the mesh in scene.xml flexcomp
+- OnShape: use onshape-to-robot (https://github.com/Rhoban/onshape-to-robot)
+- Place exported meshes in `urdf/meshes/` and update the flexcomp `file=` attribute
+  in `surgical_test/sim/scene.xml`
+
 # xArm-Python-SDK
 
 [![PyPI Downloads](https://static.pepy.tech/badge/xarm-python-sdk)](https://pepy.tech/projects/xarm-python-sdk)
