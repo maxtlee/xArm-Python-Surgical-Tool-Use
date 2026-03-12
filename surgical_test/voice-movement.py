@@ -15,7 +15,7 @@ Voice commands:
   "stop"      → emergency stop
 
 Dependencies:
-  pip install SpeechRecognition pyaudio
+  pip install SpeechRecognition pyaudio openai-whisper
 """
 
 import os
@@ -104,7 +104,9 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
     Calls on_heard(raw_text, cmd_or_None) for every recognition result.
     """
     r = sr.Recognizer()
-    r.pause_threshold = 0.6
+    r.pause_threshold = 0.3
+    r.phrase_threshold = 0.1
+    r.non_speaking_duration = 0.2
 
     try:
         mic = sr.Microphone()
@@ -119,7 +121,7 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
 
         while not stop_event.is_set():
             try:
-                audio = r.listen(source, timeout=3, phrase_time_limit=5)
+                audio = r.listen(source, timeout=3, phrase_time_limit=2)
             except sr.WaitTimeoutError:
                 on_mic_state("● Listening…")
                 continue
@@ -130,13 +132,15 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
             on_mic_state("● Processing…")
 
             try:
-                text = r.recognize_google(audio).lower()
+                text = r.recognize_whisper(
+                    audio, model="small", language="english",
+                    initial_prompt="move forward, move backward, move left, move right, move up, move down, go home, stop",
+                    no_speech_threshold=0.6,
+                    fp16=False,
+                ).lower()
             except sr.UnknownValueError:
                 on_mic_state("● Listening…")
                 on_heard("(unclear)", None)
-                continue
-            except sr.RequestError as e:
-                on_mic_state(f"API error: {e}")
                 continue
 
             cmd = parse_command(text)
