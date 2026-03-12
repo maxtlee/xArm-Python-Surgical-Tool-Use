@@ -1,6 +1,13 @@
-# Sytem dependencies 
+# System dependencies
 # sudo apt install portaudio19-dev python3-tk
 
 xarm-python-sdk
-SpeechRecognition  
-pyaudio  
+SpeechRecognition
+pyaudio
+
+# Simulation dependencies
+numpy
+mujoco>=3.1.0
+mediapy
+meshcat
+xacro  

@@ -59,6 +59,44 @@ Quick Start
     # Disconnect
     arm.disconnect()
 
+Surgical Tool Use Fork
+----------------------
+
+This fork extends the xArm SDK for voice-commanded surgical assistance with a tendon-driven soft foam hand for orthopedic hand surgery. The system supports three simulation modes:
+
+**Mock Mode** (no dependencies)
+  Zero-dependency simulation for CI and testing. All commands print to console.
+
+**MuJoCo 3D Simulation** (recommended for development)
+  Full 3D physics simulation with soft body dynamics for the foam hand and deformable tissue.
+
+  **Unix/Linux/Mac:**
+
+  .. code-block:: bash
+
+      pip install mujoco mediapy
+      bash scripts/fetch_xarm_urdf.sh
+      python scripts/urdf_to_mjcf.py
+
+  **Windows:**
+
+  .. code-block:: bash
+
+      pip install mujoco mediapy
+      scripts\fetch_xarm_urdf.bat
+      python scripts\urdf_to_mjcf.py
+
+**Real Hardware Mode**
+  Direct control of physical xArm6 and foam hand via Ethernet and USB serial.
+
+To run the voice-control GUI:
+
+.. code-block:: bash
+
+    python surgical_test/voice-movement.py
+
+Configure simulation mode in ``surgical.conf``. See the main README.md for complete setup instructions, voice commands, and workspace configuration.
+
 Documentation
 -------------
 

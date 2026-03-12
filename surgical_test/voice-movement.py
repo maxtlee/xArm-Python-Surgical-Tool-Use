@@ -24,8 +24,9 @@ import queue
 import threading
 import tkinter as tk
 from tkinter import scrolledtext, font as tkfont
+import configparser
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     import speech_recognition as sr
@@ -34,6 +35,8 @@ except ImportError:
     sys.exit(1)
 
 from xarm.wrapper import XArmAPI
+from surgical_test.sim import get_robot
+from surgical_test.command_dispatcher import CommandDispatcher
 
 
 # ---------------------------------------------------------------------------
@@ -58,12 +61,22 @@ DIRECTION_MAP = {
 def _read_ip_from_conf():
     conf_path = os.path.join(os.path.dirname(__file__), '../example/wrapper/robot.conf')
     try:
-        from configparser import ConfigParser
-        parser = ConfigParser()
+        parser = configparser.ConfigParser()
         parser.read(conf_path)
         return parser.get('xArm', 'ip')
     except Exception:
         return ''
+
+
+def _read_sim_mode():
+    """Read simulation mode from surgical.conf."""
+    conf_path = 'surgical.conf'
+    try:
+        parser = configparser.ConfigParser()
+        parser.read(conf_path)
+        return parser.get('sim', 'mode', fallback='mock')
+    except Exception:
+        return 'mock'
 
 
 def parse_command(text):
@@ -150,11 +163,15 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
     on_mic_state("Stopped")
 
 
-def execute_loop(arm, cmd_queue, stop_event, on_active, on_done, on_log):
+def execute_loop(arm, cmd_queue, stop_event, on_active, on_done, on_log, robot=None, dispatcher=None):
     """
     Drains cmd_queue and executes each command on the arm.
-    If arm is None (demo mode), commands are logged but not sent.
+    If arm is None but robot/dispatcher are provided (demo mode), uses simulation.
     Calls on_active(label) when a command starts, on_done() when it finishes.
+
+    Supports two command formats:
+      1. Legacy tuple: ('move', dx, dy, dz, label) or ('home', label) or ('stop', label)
+      2. JSON dict: {"command": "move_left", "magnitude": "small"} for dispatcher
     """
     while not stop_event.is_set():
         try:
@@ -162,30 +179,62 @@ def execute_loop(arm, cmd_queue, stop_event, on_active, on_done, on_log):
         except queue.Empty:
             continue
 
-        label = _cmd_label(cmd)
-        on_active(label)
+        # Determine if this is a tuple command or dict command
+        if isinstance(cmd, dict):
+            # JSON command for dispatcher
+            label = cmd.get('command', 'unknown')
+            on_active(label)
+            on_log(f"Dispatching: {label}")
 
-        if arm is None:
-            on_log(f"[DEMO] Would execute: {label}")
-            import time; time.sleep(0.4)
+            if dispatcher is not None:
+                try:
+                    success = dispatcher.dispatch(cmd)
+                    if not success:
+                        on_log(f"Dispatcher failed for: {label}")
+                except Exception as e:
+                    on_log(f"Dispatcher error during '{label}': {e}")
+            else:
+                on_log(f"[NO DISPATCHER] Would execute: {label}")
         else:
-            on_log(f"Executing: {label}")
-            try:
-                if cmd[0] == 'stop':
-                    arm.emergency_stop()
-                elif cmd[0] == 'home':
-                    arm.move_gohome(wait=True)
-                elif cmd[0] == 'move':
-                    _, dx, dy, dz, _ = cmd
-                    arm.set_position(
-                        x=dx, y=dy, z=dz,
-                        roll=0, pitch=0, yaw=0,
-                        relative=True,
-                        speed=SPEED,
-                        wait=True,
-                    )
-            except Exception as e:
-                on_log(f"Arm error during '{label}': {e}")
+            # Legacy tuple command
+            label = _cmd_label(cmd)
+            on_active(label)
+
+            if arm is None and robot is None:
+                on_log(f"[DEMO] Would execute: {label}")
+                import time; time.sleep(0.4)
+            elif arm is not None:
+                # Use physical arm
+                on_log(f"Executing: {label}")
+                try:
+                    if cmd[0] == 'stop':
+                        arm.emergency_stop()
+                    elif cmd[0] == 'home':
+                        arm.move_gohome(wait=True)
+                    elif cmd[0] == 'move':
+                        _, dx, dy, dz, _ = cmd
+                        arm.set_position(
+                            x=dx, y=dy, z=dz,
+                            roll=0, pitch=0, yaw=0,
+                            relative=True,
+                            speed=SPEED,
+                            wait=True,
+                        )
+                except Exception as e:
+                    on_log(f"Arm error during '{label}': {e}")
+            elif robot is not None:
+                # Use simulation robot
+                on_log(f"[SIM] Executing: {label}")
+                try:
+                    if cmd[0] == 'stop':
+                        robot.stop()
+                    elif cmd[0] == 'home':
+                        robot.go_home()
+                    elif cmd[0] == 'move':
+                        _, dx, dy, dz, _ = cmd
+                        robot.move_relative(dx=dx, dy=dy, dz=dz)
+                except Exception as e:
+                    on_log(f"Robot error during '{label}': {e}")
 
         cmd_queue.task_done()
         on_done()
@@ -261,6 +310,11 @@ class VoiceControlApp:
         self.exec_thread = None
         self.cmd_queue = queue.Queue()
 
+        # Initialize simulation robot and dispatcher
+        self.robot = None
+        self.dispatcher = None
+        self.sim_mode = _read_sim_mode()
+
         self._build_ui()
 
     # --- UI construction ---------------------------------------------------
@@ -274,9 +328,16 @@ class VoiceControlApp:
         hdr.pack(fill='x')
         tk.Label(hdr, text="xArm  Voice Control", bg='#C41230', fg='#ffffff',
                  font=('Helvetica', 22, 'bold')).pack(side='left', padx=20)
+
+        # Simulation mode label
+        self.sim_mode_label = tk.Label(hdr, text=f"Sim: {self.sim_mode}",
+                                       bg='#5a5a5a', fg='#ffffff',
+                                       font=('Helvetica', 10, 'bold'), padx=8, pady=4)
+        self.sim_mode_label.pack(side='right', padx=4, pady=6)
+
         self.status_badge = tk.Label(hdr, text="  OFFLINE  ", bg='#8f0d22', fg='#ffffff',
                                      font=('Helvetica', 10, 'bold'), padx=8, pady=4)
-        self.status_badge.pack(side='right', padx=20, pady=6)
+        self.status_badge.pack(side='right', padx=4, pady=6)
 
         main = tk.Frame(W, bg=C['bg'])
         main.pack(fill='both', expand=True, padx=16, pady=8)
@@ -482,10 +543,21 @@ class VoiceControlApp:
     # --- Button callbacks --------------------------------------------------
 
     def _on_demo(self):
-        """Start in demo mode — no robot required."""
+        """Start in demo mode — uses simulation robot based on surgical.conf."""
         self.arm = None
         self._session_active = True
-        self._log("Demo mode — commands will be simulated, no robot connected.")
+
+        # Initialize simulation robot and dispatcher
+        try:
+            self.robot = get_robot('surgical.conf')
+            self.dispatcher = CommandDispatcher(robot=self.robot)
+            self._log(f"Demo mode — using {self.sim_mode} simulation, no physical robot.")
+        except Exception as e:
+            self._log(f"Failed to initialize simulation: {e}")
+            self.robot = None
+            self.dispatcher = None
+            self._log("Demo mode — commands will be logged only.")
+
         self.status_badge.config(text="  DEMO  ", bg='#5a5a5a')
         self.btn_connect.config(state='disabled')
         self.btn_demo.config(state='disabled')
@@ -524,6 +596,9 @@ class VoiceControlApp:
         if self.arm:
             self.arm.disconnect()
             self.arm = None
+        # Clear simulation robot and dispatcher
+        self.robot = None
+        self.dispatcher = None
         self._session_active = False
         self._log("Disconnected.")
         self.status_badge.config(text="  OFFLINE  ", bg='#2e2e2e')
@@ -556,7 +631,8 @@ class VoiceControlApp:
         self.exec_thread = threading.Thread(
             target=execute_loop,
             args=(self.arm, self.cmd_queue, self.stop_event,
-                  self._set_active, self._on_cmd_done, self._log),
+                  self._set_active, self._on_cmd_done, self._log,
+                  self.robot, self.dispatcher),
             daemon=True,
         )
         self.voice_thread.start()

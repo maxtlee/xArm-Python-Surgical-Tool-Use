@@ -11,3 +11,7 @@ example/wrapper/robot.conf
 bak-xarm/
 .vscode/
 venv/
+.claude/
+urdf/
+surgical_test/__pycache__
+surgical_test/sim/__pycache__
