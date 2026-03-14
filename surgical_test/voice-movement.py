@@ -4,23 +4,30 @@ Voice-Controlled xArm — 6-DOF Cartesian
 ========================================
 Speak simple directional commands to move the end-effector.
 
+Step sizes:
+  "a little" / "slightly" / "small"  →   5 mm
+  (no qualifier)                      →  20 mm
+  "more" / "further" / "a bit more"  →  40 mm
+  "a lot" / "much" / "way"           →  80 mm
+
 Voice commands:
-  "forward"   → +X  (20 mm)
-  "backward"  → -X  (20 mm)
-  "left"      → +Y  (20 mm)
-  "right"     → -Y  (20 mm)
-  "up"        → +Z  (20 mm)
-  "down"      → -Z  (20 mm)
-  "go home"   → return to home position
-  "stop"      → emergency stop
-  "open"      → open DexHand gripper
-  "close"     → close DexHand gripper
+  "forward [qualifier]"   → +X
+  "backward [qualifier]"  → -X
+  "left [qualifier]"      → +Y
+  "right [qualifier]"     → -Y
+  "up [qualifier]"        → +Z
+  "down [qualifier]"      → -Z
+  "go home"               → return to home position
+  "stop"                  → emergency stop
+  "open"                  → open DexHand gripper
+  "close"                 → close DexHand gripper
 
 Dependencies:
   pip install SpeechRecognition pyaudio openai-whisper dynamixel-sdk
 """
 
 import os
+import re
 import sys
 import queue
 import threading
@@ -180,18 +187,30 @@ class GripperController:
 # Helpers
 # ---------------------------------------------------------------------------
 
-STEP_MM = 20    # mm moved per voice command
-SPEED   = 50    # mm/s
+SPEED = 50  # mm/s
 
-# Maps spoken words → (dx, dy, dz, label)
+# Step sizes for each magnitude qualifier (mm)
+STEP = {
+    'little':  5,
+    'normal': 20,
+    'more':   40,
+    'lot':    80,
+}
+
+# Words that trigger each magnitude level
+LITTLE_WORDS  = {'little', 'slightly', 'small', 'tiny', 'bit'}
+MORE_WORDS    = {'more', 'further', 'farther', 'extra'}
+LOT_WORDS     = {'lot', 'much', 'way', 'far', 'big', 'large', 'huge'}
+
+# Maps direction keyword → unit vector (dx, dy, dz) and display label
 DIRECTION_MAP = {
-    'forward':  ( STEP_MM,       0,       0, 'Forward  +X'),
-    'backward': (-STEP_MM,       0,       0, 'Backward −X'),
-    'back':     (-STEP_MM,       0,       0, 'Backward −X'),
-    'left':     (      0,  STEP_MM,       0, 'Left     +Y'),
-    'right':    (      0, -STEP_MM,       0, 'Right    −Y'),
-    'up':       (      0,       0,  STEP_MM, 'Up       +Z'),
-    'down':     (      0,       0, -STEP_MM, 'Down     −Z'),
+    'forward':  ( 1,  0,  0, 'Forward  +X'),
+    'backward': (-1,  0,  0, 'Backward −X'),
+    'back':     (-1,  0,  0, 'Backward −X'),
+    'left':     ( 0,  1,  0, 'Left     +Y'),
+    'right':    ( 0, -1,  0, 'Right    −Y'),
+    'up':       ( 0,  0,  1, 'Up       +Z'),
+    'down':     ( 0,  0, -1, 'Down     −Z'),
 }
 
 
@@ -207,27 +226,55 @@ def _read_ip_from_conf():
         return ''
 
 
+def _detect_magnitude(words):
+    """Return the step size (mm) based on qualifier words in the utterance."""
+    if words & LOT_WORDS:
+        return STEP['lot']
+    if words & MORE_WORDS:
+        return STEP['more']
+    if words & LITTLE_WORDS:
+        return STEP['little']
+    return STEP['normal']
+
+
+def _tokenize(text):
+    """Lowercase and strip punctuation, return a set of words."""
+    return set(re.sub(r'[^\w\s]', '', text.lower()).split())
+
+
 def parse_command(text):
     """
+    Parses natural-language commands with optional magnitude qualifiers.
+
     Returns one of:
-      ('move', dx, dy, dz, label)
+      ('move', dx, dy, dz, label)  — scaled by detected magnitude
       ('home', label)
       ('stop', label)
+      ('gripper_open', label)
+      ('gripper_close', label)
       None
     """
-    text = text.lower().strip()
+    words = _tokenize(text)
 
-    if 'stop' in text:
+    if 'stop' in words:
         return ('stop', 'Emergency Stop')
-    if 'home' in text:
+    # Require the exact adjacent phrase to avoid hallucinated single words
+    cleaned = re.sub(r'[^\w\s]', '', text.lower())
+    if 'go home' in cleaned:
         return ('home', 'Go Home')
-    if 'open' in text:
+    if 'open' in words:
         return ('gripper_open', 'Open Gripper')
-    if 'close' in text:
+    if 'close' in words:
         return ('gripper_close', 'Close Gripper')
 
-    for word, (dx, dy, dz, label) in DIRECTION_MAP.items():
-        if word in text:
+    for keyword, (ux, uy, uz, base_label) in DIRECTION_MAP.items():
+        if keyword in words:
+            step = _detect_magnitude(words)
+            dx, dy, dz = ux * step, uy * step, uz * step
+            mag_names = {STEP['little']: 'a little', STEP['normal']: '',
+                         STEP['more']: 'more', STEP['lot']: 'a lot'}
+            qualifier = mag_names.get(step, '')
+            label = f"{base_label}  {qualifier}({step} mm)".strip()
             return ('move', dx, dy, dz, label)
 
     return None
@@ -249,9 +296,9 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
     Calls on_heard(raw_text, cmd_or_None) for every recognition result.
     """
     r = sr.Recognizer()
-    r.pause_threshold = 0.3
+    r.pause_threshold = 0.4        # short silence window → fast detection
     r.phrase_threshold = 0.1
-    r.non_speaking_duration = 0.2
+    r.non_speaking_duration = 0.3
 
     try:
         mic = sr.Microphone()
@@ -266,7 +313,7 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
 
         while not stop_event.is_set():
             try:
-                audio = r.listen(source, timeout=3, phrase_time_limit=2)
+                audio = r.listen(source, timeout=3, phrase_time_limit=3)
             except sr.WaitTimeoutError:
                 on_mic_state("● Listening…")
                 continue
@@ -279,8 +326,8 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
             try:
                 text = r.recognize_whisper(
                     audio, model="small", language="english",
-                    initial_prompt="move forward, move backward, move left, move right, move up, move down, go home, stop, open, close",
-                    no_speech_threshold=0.6,
+                    initial_prompt="move forward a little, move backward more, move left a lot, move right slightly, move up, move down, go home, stop, open, close",
+                    no_speech_threshold=0.8,
                     fp16=False,
                 ).lower()
             except sr.UnknownValueError:
@@ -339,7 +386,10 @@ def execute_loop(arm, gripper, cmd_queue, stop_event, on_active, on_done, on_log
                 if cmd[0] == 'stop':
                     arm.emergency_stop()
                 elif cmd[0] == 'home':
-                    arm.move_gohome(wait=True)
+                    arm.set_servo_angle(
+                        angle=[-3.5, 9.4, 0, 13.9, 0, -23, 0],
+                        speed=30, wait=True,
+                    )
                 elif cmd[0] == 'move':
                     _, dx, dy, dz, _ = cmd
                     arm.set_position(
@@ -469,12 +519,20 @@ class VoiceControlApp:
                            bg=C['surface'], fg=C['text'],
                            activebackground='#C41230', activeforeground=C['text'],
                            relief='flat', bd=0, font=('Courier', 12))
-        cmd_menu.add_command(label=f'"forward / backward"   →  ±X  ({STEP_MM} mm)', state='disabled')
-        cmd_menu.add_command(label=f'"left / right"         →  ±Y  ({STEP_MM} mm)', state='disabled')
-        cmd_menu.add_command(label=f'"up / down"            →  ±Z  ({STEP_MM} mm)', state='disabled')
+        cmd_menu.add_command(label='Qualifiers:  (none) = 20 mm  |  a little = 5 mm  |  more = 40 mm  |  a lot = 80 mm', state='disabled')
         cmd_menu.add_separator()
-        cmd_menu.add_command(label='"go home"              →  return to home position', state='disabled')
-        cmd_menu.add_command(label='"stop"                 →  emergency stop',         state='disabled')
+        cmd_menu.add_command(label='"forward [qualifier]"   →  +X', state='disabled')
+        cmd_menu.add_command(label='"backward [qualifier]"  →  -X', state='disabled')
+        cmd_menu.add_command(label='"left [qualifier]"      →  +Y', state='disabled')
+        cmd_menu.add_command(label='"right [qualifier]"     →  -Y', state='disabled')
+        cmd_menu.add_command(label='"up [qualifier]"        →  +Z', state='disabled')
+        cmd_menu.add_command(label='"down [qualifier]"      →  -Z', state='disabled')
+        cmd_menu.add_separator()
+        cmd_menu.add_command(label='"go home"               →  return to home position', state='disabled')
+        cmd_menu.add_command(label='"stop"                  →  emergency stop',          state='disabled')
+        cmd_menu.add_separator()
+        cmd_menu.add_command(label='"open"                  →  open DexHand gripper',   state='disabled')
+        cmd_menu.add_command(label='"close"                 →  close DexHand gripper',  state='disabled')
         menubar.add_cascade(label='Commands', menu=cmd_menu)
         W.config(menu=menubar)
 
@@ -607,13 +665,16 @@ class VoiceControlApp:
         ref_out.pack(fill='x', pady=(0, 16), **P)
 
         commands = [
-            ('forward / backward', f'±X  ({STEP_MM} mm)'),
-            ('left / right',       f'±Y  ({STEP_MM} mm)'),
-            ('up / down',          f'±Z  ({STEP_MM} mm)'),
-            ('go home',            'return to home position'),
-            ('stop',               'emergency stop'),
-            ('open',               'open DexHand gripper'),
-            ('close',              'close DexHand gripper'),
+            ('forward [qualifier]',  '±X  (5 / 20 / 40 / 80 mm)'),
+            ('backward [qualifier]', '±X  (5 / 20 / 40 / 80 mm)'),
+            ('left [qualifier]',     '±Y  (5 / 20 / 40 / 80 mm)'),
+            ('right [qualifier]',    '±Y  (5 / 20 / 40 / 80 mm)'),
+            ('up [qualifier]',       '±Z  (5 / 20 / 40 / 80 mm)'),
+            ('down [qualifier]',     '±Z  (5 / 20 / 40 / 80 mm)'),
+            ('go home',              'return to home position'),
+            ('stop',                 'emergency stop'),
+            ('open',                 'open DexHand gripper'),
+            ('close',                'close DexHand gripper'),
         ]
         ref_grid = tk.Frame(ref_in, bg=C['surface'])
         ref_grid.pack(fill='x', padx=12, pady=10)
