@@ -10,3 +10,4 @@ pyyaml
 dynamixel_sdk
 soundfile
 openai-whisper
+faster-whisper

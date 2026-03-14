@@ -26,6 +26,7 @@ Dependencies:
   pip install SpeechRecognition pyaudio openai-whisper dynamixel-sdk
 """
 
+import io
 import os
 import re
 import sys
@@ -33,6 +34,7 @@ import queue
 import threading
 import tkinter as tk
 from tkinter import scrolledtext, font as tkfont
+import numpy as np
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
@@ -189,6 +191,10 @@ class GripperController:
 
 SPEED = 50  # mm/s
 
+# RMS amplitude below which audio is considered silence and skipped (0–1 scale).
+# Typical speech RMS is 0.05–0.2; background noise is usually under 0.01.
+LOUDNESS_THRESHOLD = 0.05
+
 # Step sizes for each magnitude qualifier (mm)
 STEP = {
     'little':  5,
@@ -292,11 +298,31 @@ def _cmd_label(cmd):
 def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
     """
     Captures mic audio, recognises speech, and enqueues parsed commands.
+
+    Uses faster-whisper (CTranslate2 + INT8) which is 4–8× faster than
+    openai-whisper on CPU. Key optimisations:
+      - INT8 quantised tiny.en model (English-only, no language detection step)
+      - beam_size=1 (greedy decode — single pass, no beam search overhead)
+      - built-in VAD filter skips silent chunks before they reach the model
+      - RMS loudness gate rejects quiet frames before any model work
+
+    Install: pip install faster-whisper
+
     Calls on_mic_state(str) to update the mic indicator.
     Calls on_heard(raw_text, cmd_or_None) for every recognition result.
     """
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        on_mic_state("ERROR: run  pip install faster-whisper")
+        return
+
+    on_mic_state("Loading Whisper model…")
+    # int8 quantisation cuts memory and inference time ~2× on CPU
+    whisper_model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+
     r = sr.Recognizer()
-    r.pause_threshold = 0.4        # short silence window → fast detection
+    r.pause_threshold = 0.4
     r.phrase_threshold = 0.1
     r.non_speaking_duration = 0.3
 
@@ -306,6 +332,9 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
         on_mic_state(f"Mic error: {e}")
         return
 
+    _PROMPT = ("move forward a little, move backward more, move left a lot, "
+               "move right slightly, move up, move down, go home, stop, open, close")
+
     with mic as source:
         on_mic_state("Calibrating microphone…")
         r.adjust_for_ambient_noise(source, duration=1)
@@ -313,7 +342,7 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
 
         while not stop_event.is_set():
             try:
-                audio = r.listen(source, timeout=3, phrase_time_limit=3)
+                audio = r.listen(source, timeout=3, phrase_time_limit=1.5)
             except sr.WaitTimeoutError:
                 on_mic_state("● Listening…")
                 continue
@@ -324,13 +353,31 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
             on_mic_state("● Processing…")
 
             try:
-                text = r.recognize_whisper(
-                    audio, model="small", language="english",
-                    initial_prompt="move forward a little, move backward more, move left a lot, move right slightly, move up, move down, go home, stop, open, close",
-                    no_speech_threshold=0.8,
-                    fp16=False,
-                ).lower()
-            except sr.UnknownValueError:
+                # Decode WAV bytes → float32 numpy array at 16 kHz mono
+                wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
+                audio_array = np.frombuffer(wav_bytes[44:], dtype=np.int16).astype(np.float32) / 32768.0
+
+                # RMS loudness gate — skip before touching the model
+                if np.sqrt(np.mean(audio_array ** 2)) < LOUDNESS_THRESHOLD:
+                    on_mic_state("● Listening…")
+                    continue
+
+                # beam_size=1 → greedy decoding (single decode pass, no beam search)
+                # vad_filter → faster-whisper skips internal silent segments
+                segments, _ = whisper_model.transcribe(
+                    audio_array,
+                    language="en",
+                    initial_prompt=_PROMPT,
+                    beam_size=1,
+                    vad_filter=True,
+                )
+                text = " ".join(s.text for s in segments).lower().strip()
+            except Exception as e:
+                on_mic_state("● Listening…")
+                on_heard(f"(error: {e})", None)
+                continue
+
+            if not text:
                 on_mic_state("● Listening…")
                 on_heard("(unclear)", None)
                 continue
