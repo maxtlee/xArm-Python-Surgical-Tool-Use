@@ -72,6 +72,10 @@ A GUI window will open. Click **Connect** (the IP is pre-filled from `robot.conf
 | "go home"                      | Return to home position |
 | "stop"                         | Emergency stop          |
 
+# DexKit Hand Usage
+
+In order to run the dexkit hand control script (dexKit_control/NIBIB1.py), you will have to change the port name to match the one it is on your computer. the port name is hardcoded in NIBIB1.py line 206. 
+
 # xArm-Python-SDK
 
 [![PyPI Downloads](https://static.pepy.tech/badge/xarm-python-sdk)](https://pepy.tech/projects/xarm-python-sdk)

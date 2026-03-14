@@ -1,0 +1,148 @@
+poses:
+- name: Home
+  PinkyFlexion: 20.0
+  RingFlexion: 20.0
+  MiddleFlexion: 20.0
+  IndexFlexion: 20.0
+  ThumbAdduction: 20.0
+  ThumbFlexion: 20.0
+- name: HandShake
+  PinkyFlexion: 200.0
+  RingFlexion: 180.0
+  MiddleFlexion: 160.0
+  IndexFlexion: 140.0
+  ThumbAdduction: 20.0
+  ThumbFlexion: 100.0
+- name: TowelGrasp
+  PinkyFlexion: 245.0
+  RingFlexion: 250.0
+  MiddleFlexion: 260.0
+  IndexFlexion: 205.0
+  ThumbAdduction: 20.0
+  ThumbFlexion: 140.0
+- name: Pliers
+  PinkyFlexion: 20.0
+  RingFlexion: 20.0
+  MiddleFlexion: 20.0
+  IndexFlexion: 245.0
+  ThumbAdduction: 130.0
+  ThumbFlexion: 140.0
+- name: PillBottle
+  PinkyFlexion: 290.0
+  RingFlexion: 170.0
+  MiddleFlexion: 95.0
+  IndexFlexion: 85.0
+  ThumbAdduction: 20.0
+  ThumbFlexion: 180.0
+- name: Pen_Thumb
+  PinkyFlexion: 20.0
+  RingFlexion: 20.0
+  MiddleFlexion: 20.0
+  IndexFlexion: 150.0
+  ThumbAdduction: 190.0
+  ThumbFlexion: 190.0
+- name: Pen_Index
+  PinkyFlexion: 20.0
+  RingFlexion: 20.0
+  MiddleFlexion: 20.0
+  IndexFlexion: 350.0
+  ThumbAdduction: 190.0
+  ThumbFlexion: 190.0
+- name: PeaceSign
+  PinkyFlexion: 300.0
+  RingFlexion: 315.0
+  MiddleFlexion: 20.0
+  IndexFlexion: 20.0
+  ThumbAdduction: 150.0
+  ThumbFlexion: 220.0
+- name: TestPose
+  PinkyFlexion: 30.0
+  RingFlexion: 30.0
+  MiddleFlexion: 30.0
+  IndexFlexion: 30.0
+  ThumbAdduction: 30.0
+  ThumbFlexion: 30.0
+- name: test1
+  PinkyFlexion: 155.0
+  RingFlexion: 160.0
+  MiddleFlexion: 20.74
+  IndexFlexion: 19.25
+  ThumbAdduction: 21.27
+  ThumbFlexion: 19.25
+- name: test2
+  PinkyFlexion: 200.0
+  RingFlexion: 187.0
+  MiddleFlexion: 20.74
+  IndexFlexion: 19.25
+  ThumbAdduction: 267.0
+  ThumbFlexion: 19.25
+sequences:
+- name: Reset
+  actions:
+  - pose: Home
+- name: Hand Shake
+  actions:
+  - pose: Home
+  - delay: 0.1
+  - pose: HandShake
+  - delay: 2.9
+  - pose: Home
+  - delay: 0.5
+- name: Grasp Towel
+  actions:
+  - pose: Home
+  - delay: 0.1
+  - pose: TowelGrasp
+  - delay: 9.9
+  - pose: Home
+  - delay: 0.5
+- name: Grasp Medicine
+  actions:
+  - pose: Home
+  - delay: 0.1
+  - pose: PillBottle
+  - delay: 4.9
+  - pose: Home
+  - delay: 0.5
+- name: Pen Pickup
+  actions:
+  - pose: Home
+  - delay: 0.5
+  - pose: Pen_Thumb
+  - delay: 1.5
+  - pose: Pen_Index
+  - delay: 5.0
+  - pose: Home
+  - delay: 0.5
+- name: Squeeze Pliers
+  actions:
+  - pose: Home
+  - delay: 0.1
+  - pose: Pliers
+  - delay: 1.2
+  - pose: Home
+  - delay: 1.2
+  - pose: Pliers
+  - delay: 1.2
+  - pose: Home
+  - delay: 1.2
+  - pose: Pliers
+  - delay: 1.2
+  - pose: Home
+  - delay: 0.5
+- name: Peace Sign
+  actions:
+  - pose: Home
+  - delay: 0.1
+  - pose: PeaceSign
+  - delay: 2.9
+  - pose: Home
+  - delay: 0.5
+- name: Test
+  actions:
+  - pose: Home
+  - delay: 0.25
+  - pose: TestPose
+  - delay: 0.25
+  - pose: Home
+  - delay: 0.25
