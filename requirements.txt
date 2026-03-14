@@ -8,3 +8,5 @@ PyQt5
 pyserial
 pyyaml
 dynamixel_sdk
+soundfile
+openai-whisper

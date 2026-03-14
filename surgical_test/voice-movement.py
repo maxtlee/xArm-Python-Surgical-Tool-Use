@@ -13,9 +13,11 @@ Voice commands:
   "down"      → -Z  (20 mm)
   "go home"   → return to home position
   "stop"      → emergency stop
+  "open"      → open DexHand gripper
+  "close"     → close DexHand gripper
 
 Dependencies:
-  pip install SpeechRecognition pyaudio openai-whisper
+  pip install SpeechRecognition pyaudio openai-whisper dynamixel-sdk
 """
 
 import os
@@ -34,6 +36,144 @@ except ImportError:
     sys.exit(1)
 
 from xarm.wrapper import XArmAPI
+
+try:
+    from dynamixel_sdk import PortHandler, PacketHandler
+    _DYNAMIXEL_AVAILABLE = True
+except ImportError:
+    _DYNAMIXEL_AVAILABLE = False
+
+import yaml
+
+
+# ---------------------------------------------------------------------------
+# Gripper (DexHand via Dynamixel)
+# ---------------------------------------------------------------------------
+
+_POSES_FILE = os.path.join(os.path.dirname(__file__), "gripper_poses.yaml")
+
+# Motor name → Dynamixel ID (matches NIBIB1.py Config.MOTOR_NAMES order)
+_MOTOR_IDS = {
+    "PinkyFlexion":   0,
+    "RingFlexion":    1,
+    "MiddleFlexion":  2,
+    "IndexFlexion":   3,
+    "ThumbAdduction": 4,
+    "ThumbFlexion":   5,
+}
+
+_TICKS_PER_REV = 4096   # matches NIBIB1.py Config.TICKS_PER_REV
+
+_ADDR_TORQUE_ENABLE    = 64
+_ADDR_PROFILE_VELOCITY = 112
+_ADDR_GOAL_POSITION    = 116
+_ADDR_PRESENT_POSITION = 132
+
+
+def _degrees_to_ticks(degrees):
+    """Identical to NIBIB1.py Utility.degrees_to_ticks()."""
+    return int(degrees * _TICKS_PER_REV / 360)
+
+
+def _ticks_to_degrees(ticks):
+    """Identical to NIBIB1.py Utility.ticks_to_degrees()."""
+    return float(ticks * 360 / _TICKS_PER_REV)
+
+
+def _load_gripper_config(path=_POSES_FILE):
+    """Load gripper_poses.yaml and return (config_dict, poses_dict)."""
+    with open(path, "r") as f:
+        data = yaml.safe_load(f)
+    return data.get("config", {}), data.get("poses", {})
+
+
+def _pose_to_tick_list(pose_data):
+    """Convert a pose's motor_degrees mapping to an ordered tick list [ID0..ID5].
+
+    Matches NIBIB1.py HandDemoWindow.run_sequence():
+      ticks = [Utility.degrees_to_ticks(val) for val in pose_values]
+    """
+    motor_degrees = pose_data.get("motor_degrees", {})
+    return [
+        _degrees_to_ticks(float(motor_degrees.get(name, 0.0)))
+        for name, _ in sorted(_MOTOR_IDS.items(), key=lambda kv: kv[1])
+    ]
+
+
+class GripperController:
+    """Controls the DexHand via Dynamixel.
+
+    Mirrors NIBIB1.py DynamixelController: degrees in YAML → ticks at runtime,
+    home offsets recorded at init, per-motor profile velocity.
+    """
+
+    def __init__(self, poses_file=_POSES_FILE):
+        if not _DYNAMIXEL_AVAILABLE:
+            raise RuntimeError("dynamixel_sdk not installed — run: pip install dynamixel-sdk")
+
+        cfg, poses = _load_gripper_config(poses_file)
+
+        port      = cfg.get("port", "/dev/ttyACM0")
+        baud      = int(cfg.get("baud_rate", 2_000_000))
+        protocol  = float(cfg.get("protocol_version", 2.0))
+        prof_vel  = int(cfg.get("profile_velocity", 100))
+
+        self._open_ticks  = _pose_to_tick_list(poses.get("open",  {}))
+        self._close_ticks = _pose_to_tick_list(poses.get("close", {}))
+
+        self._ph = PortHandler(port)
+        if not self._ph.openPort():
+            raise RuntimeError(f"Failed to open gripper port {port}")
+        if not self._ph.setBaudRate(baud):
+            raise RuntimeError("Failed to set gripper baud rate")
+        self._pkt = PacketHandler(protocol)
+
+        # Enable torque and set profile velocity per motor individually,
+        # matching NIBIB1.py DynamixelController.__init__()
+        for dxl_id in _MOTOR_IDS.values():
+            self._pkt.write1ByteTxRx(self._ph, dxl_id, _ADDR_TORQUE_ENABLE, 1)
+            self._pkt.write4ByteTxRx(self._ph, dxl_id, _ADDR_PROFILE_VELOCITY, prof_vel)
+
+        # Record present position of each motor as home offset,
+        # matching NIBIB1.py HandPoseControllerWindow.__init__():
+        #   self.home_offsets = self.ctrl.get_all_positions()
+        self.home_offsets = self.get_all_positions()
+
+    # -- Position readback (mirrors DynamixelController.get_position) -------
+
+    def get_position(self, dxl_id):
+        """Read present position in ticks, handling two's-complement rollover."""
+        present, _, _ = self._pkt.read4ByteTxRx(
+            self._ph, dxl_id, _ADDR_PRESENT_POSITION
+        )
+        return present - 0x100000000 if present & 0x80000000 else present
+
+    def get_all_positions(self):
+        return [self.get_position(dxl_id) for _, dxl_id in
+                sorted(_MOTOR_IDS.items(), key=lambda kv: kv[1])]
+
+    # -- Position commands (mirrors DynamixelController.set_position) --------
+
+    def _set_positions(self, tick_list):
+        """Send absolute tick positions to each motor individually,
+        matching NIBIB1.py DynamixelController.set_all_positions()."""
+        for _, dxl_id in sorted(_MOTOR_IDS.items(), key=lambda kv: kv[1]):
+            ticks = tick_list[dxl_id]
+            self._pkt.write4ByteTxRx(
+                self._ph, dxl_id, _ADDR_GOAL_POSITION, ticks & 0xFFFFFFFF
+            )
+
+    def open(self):
+        self._set_positions(self._open_ticks)
+
+    def close(self):
+        self._set_positions(self._close_ticks)
+
+    def disconnect(self):
+        """Disable torque and close port, matching DynamixelController.close()."""
+        for dxl_id in _MOTOR_IDS.values():
+            self._pkt.write1ByteTxRx(self._ph, dxl_id, _ADDR_TORQUE_ENABLE, 0)
+        self._ph.closePort()
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +221,10 @@ def parse_command(text):
         return ('stop', 'Emergency Stop')
     if 'home' in text:
         return ('home', 'Go Home')
+    if 'open' in text:
+        return ('gripper_open', 'Open Gripper')
+    if 'close' in text:
+        return ('gripper_close', 'Close Gripper')
 
     for word, (dx, dy, dz, label) in DIRECTION_MAP.items():
         if word in text:
@@ -135,7 +279,7 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
             try:
                 text = r.recognize_whisper(
                     audio, model="small", language="english",
-                    initial_prompt="move forward, move backward, move left, move right, move up, move down, go home, stop",
+                    initial_prompt="move forward, move backward, move left, move right, move up, move down, go home, stop, open, close",
                     no_speech_threshold=0.6,
                     fp16=False,
                 ).lower()
@@ -155,10 +299,11 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
     on_mic_state("Stopped")
 
 
-def execute_loop(arm, cmd_queue, stop_event, on_active, on_done, on_log):
+def execute_loop(arm, gripper, cmd_queue, stop_event, on_active, on_done, on_log):
     """
-    Drains cmd_queue and executes each command on the arm.
-    If arm is None (demo mode), commands are logged but not sent.
+    Drains cmd_queue and executes each command on the arm or gripper.
+    If arm is None (demo mode), arm commands are logged but not sent.
+    Gripper commands are always executed if gripper is not None.
     Calls on_active(label) when a command starts, on_done() when it finishes.
     """
     while not stop_event.is_set():
@@ -170,7 +315,22 @@ def execute_loop(arm, cmd_queue, stop_event, on_active, on_done, on_log):
         label = _cmd_label(cmd)
         on_active(label)
 
-        if arm is None:
+        is_gripper_cmd = cmd[0] in ('gripper_open', 'gripper_close')
+
+        if is_gripper_cmd:
+            if gripper is None:
+                on_log(f"[DEMO] Would execute: {label}")
+                import time; time.sleep(0.4)
+            else:
+                on_log(f"Executing: {label}")
+                try:
+                    if cmd[0] == 'gripper_open':
+                        gripper.open()
+                    elif cmd[0] == 'gripper_close':
+                        gripper.close()
+                except Exception as e:
+                    on_log(f"Gripper error during '{label}': {e}")
+        elif arm is None:
             on_log(f"[DEMO] Would execute: {label}")
             import time; time.sleep(0.4)
         else:
@@ -274,11 +434,22 @@ class VoiceControlApp:
         self.root.minsize(700, 700)
 
         self.arm = None
+        self.gripper = None
         self._session_active = False  # True when connected or in demo mode
         self.stop_event = threading.Event()
         self.voice_thread = None
         self.exec_thread = None
         self.cmd_queue = queue.Queue()
+
+        # Attempt to connect to the DexHand gripper at startup
+        try:
+            self.gripper = GripperController()
+        except Exception as e:
+            self.gripper = None
+            # Will log after UI is built; store message for later
+            self._gripper_init_error = str(e)
+        else:
+            self._gripper_init_error = None
 
         self._build_ui()
 
@@ -431,7 +602,42 @@ class VoiceControlApp:
         )
         self.status_log.pack(fill='both', expand=True)
 
+        # ── Reference card ──────────────────────────────────────────────────
+        ref_out, ref_in = _section(main, "Voice Commands")
+        ref_out.pack(fill='x', pady=(0, 16), **P)
+
+        commands = [
+            ('forward / backward', f'±X  ({STEP_MM} mm)'),
+            ('left / right',       f'±Y  ({STEP_MM} mm)'),
+            ('up / down',          f'±Z  ({STEP_MM} mm)'),
+            ('go home',            'return to home position'),
+            ('stop',               'emergency stop'),
+            ('open',               'open DexHand gripper'),
+            ('close',              'close DexHand gripper'),
+        ]
+        ref_grid = tk.Frame(ref_in, bg=C['surface'])
+        ref_grid.pack(fill='x', padx=12, pady=10)
+        ref_grid.columnconfigure(0, minsize=220)
+        ref_grid.columnconfigure(1, weight=1)
+        for i, (cmd_txt, desc) in enumerate(commands):
+            tk.Label(ref_grid, text=f'"{cmd_txt}"', bg=C['surface'], fg='#C41230',
+                     font=('Courier', 12, 'bold'), anchor='w').grid(
+                         row=i, column=0, sticky='w', pady=2)
+            tk.Label(ref_grid, text=f'  ->  {desc}', bg=C['surface'], fg=C['subtext'],
+                     font=('Helvetica', 12), anchor='w').grid(
+                         row=i, column=1, sticky='w', pady=2)
+
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Report gripper connection status once UI is ready
+        self.root.after(
+            100,
+            lambda: (
+                self._log("Gripper connected on " + ".")
+                if self.gripper is not None
+                else self._log(f"Gripper not connected: {self._gripper_init_error}")
+            ),
+        )
 
     # --- Thread-safe GUI updates -------------------------------------------
 
@@ -584,7 +790,7 @@ class VoiceControlApp:
         )
         self.exec_thread = threading.Thread(
             target=execute_loop,
-            args=(self.arm, self.cmd_queue, self.stop_event,
+            args=(self.arm, self.gripper, self.cmd_queue, self.stop_event,
                   self._set_active, self._on_cmd_done, self._log),
             daemon=True,
         )
@@ -626,6 +832,9 @@ class VoiceControlApp:
     def _on_close(self):
         """Window close handler — disconnect cleanly before destroying the window."""
         self._on_disconnect()
+        if self.gripper:
+            self.gripper.disconnect()
+            self.gripper = None
         self.root.destroy()
 
 

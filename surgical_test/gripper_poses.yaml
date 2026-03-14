@@ -1,0 +1,42 @@
+# DexHand Gripper Poses
+# =====================
+# Positions are in DEGREES (0–360). Converted to ticks at runtime
+# using the same formula as NIBIB1.py: ticks = degrees * 4096 / 360.
+# Motor IDs map to:
+#   0: PinkyFlexion
+#   1: RingFlexion
+#   2: MiddleFlexion
+#   3: IndexFlexion
+#   4: ThumbAdduction
+#   5: ThumbFlexion
+#
+# profile_velocity controls movement speed (lower = slower).
+
+config:
+  port: /dev/ttyACM0
+  baud_rate: 2000000
+  protocol_version: 2.0
+  profile_velocity: 100       # applied to all motors on init
+
+poses:
+  open:
+    # Fingers fully extended, thumb in neutral adduction
+    description: "All fingers extended — wide open hand"
+    motor_degrees:
+      PinkyFlexion:    20.0
+      RingFlexion:     20.0
+      MiddleFlexion:   20.0
+      IndexFlexion:    20.0
+      ThumbAdduction:  20.0
+      ThumbFlexion:    20.0
+
+  close:
+    # Fingers curled into a cylindrical grasp, thumb opposing
+    description: "Cylindrical grasp — fingers wrapped around an object"
+    motor_degrees:
+      PinkyFlexion:    175.0
+      RingFlexion:     220.0
+      MiddleFlexion:   212.0
+      IndexFlexion:    218.0
+      ThumbAdduction:  68.0
+      ThumbFlexion:    222.0
