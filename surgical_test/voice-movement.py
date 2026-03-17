@@ -202,7 +202,7 @@ JOINT_POSITIONS = {
     # 'pickup':  [-9.3,  2.8,  10.4, 24.5,  92.9, 163.6,  -90.4],  
     # 'home':    [-95.4,  93,  100.5, 19.9,  -87.1, 92.7,  2.9],
     # 'pickup':    [-95.4,  93,  100.5, 19.9,  -266.4, 92.7,  2.9],
-    'home':    [-154,  93,  97, 29,  -90, 92,  -5],
+    'home':    [-156,  93,  97, 26,  -93, 94,  -95],
     'pickup':    [-139,  91,  98, 34.5,  -48, 15,  -17],
     'engage':  [-83,  91,  97,  59,  -100,  88.9,  38.2],  
     'retract':  [-87,  91,  95,  63,  -100,  89,  28],  
@@ -851,11 +851,15 @@ class VoiceControlApp:
     # --- Button callbacks --------------------------------------------------
 
     def _on_demo(self):
-        """Start in demo mode — no robot required."""
+        """Start with arm offline — gripper (if connected) is still live."""
         self.arm = None
         self._session_active = True
-        self._log("Demo mode — commands will be simulated, no robot connected.")
-        self.status_badge.config(text="  DEMO  ", bg='#5a5a5a')
+        if self.gripper is not None:
+            self._log("Gripper-only mode — gripper is live, arm commands will be simulated.")
+            self.status_badge.config(text="  GRIPPER ONLY  ", bg='#8f0d22')
+        else:
+            self._log("Demo mode — commands will be simulated, no robot connected.")
+            self.status_badge.config(text="  DEMO  ", bg='#5a5a5a')
         self.btn_connect.config(state='disabled')
         self.btn_demo.config(state='disabled')
         self.btn_disconnect.config(state='normal', bg=C['grey'])
@@ -882,13 +886,19 @@ class VoiceControlApp:
         except Exception as e:
             self._log(f"Connection failed: {e}")
             self.arm = None
+            if self.gripper is not None:
+                self._log("Arm unavailable — falling back to gripper-only mode.")
+                self._on_demo()
             return
 
         self.btn_connect.config(state='disabled')
         self.btn_disconnect.config(state='normal', bg=C['grey'])
         self.btn_start.config(state='normal', bg=C['blue'])
         self.btn_estop.config(state='normal', bg=C['red'])
-        self.status_badge.config(text="  LIVE  ", bg='#8f0d22')
+        if self.gripper is not None:
+            self.status_badge.config(text="  LIVE  ", bg='#8f0d22')
+        else:
+            self.status_badge.config(text="  ARM ONLY  ", bg='#8f0d22')
 
     def _on_disconnect(self):
         """Stop listening, disconnect the arm, and reset all buttons to their
