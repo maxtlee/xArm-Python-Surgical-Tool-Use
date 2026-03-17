@@ -34,9 +34,9 @@ poses:
     # Fingers curled into a cylindrical grasp, thumb opposing
     description: "Cylindrical grasp — fingers wrapped around an object"
     motor_degrees:
-      PinkyFlexion:    175.0
-      RingFlexion:     220.0
-      MiddleFlexion:   212.0
-      IndexFlexion:    218.0
+      PinkyFlexion:    335.0
+      RingFlexion:     320.0
+      MiddleFlexion:   232.0
+      IndexFlexion:    248.0
       ThumbAdduction:  68.0
       ThumbFlexion:    222.0
