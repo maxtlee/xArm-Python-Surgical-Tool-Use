@@ -18,6 +18,9 @@ Voice commands:
   "up [qualifier]"        → +Z
   "down [qualifier]"      → -Z
   "go home"               → return to home position
+  "pickup"                → move to pickup position
+  "engage"                → move to engage position
+  "retract"               → move to retract position
   "stop"                  → emergency stop
   "open"                  → open DexHand gripper
   "close"                 → close DexHand gripper
@@ -191,6 +194,22 @@ class GripperController:
 
 SPEED = 50  # mm/s
 
+# Hardcoded joint-angle positions [j1..j7] (degrees).  Edit these to match
+# your robot's actual setpoints.
+JOINT_POSITIONS = {
+    # 'home': [-86.9, 81.1, 132.1, 53, -71.4, 102.1, 47.8],
+    # 'home':    [-9.3,  2.8,  10.4, 24.5,  92.9, 1.7,  -90.4],
+    # 'pickup':  [-9.3,  2.8,  10.4, 24.5,  92.9, 163.6,  -90.4],  
+    # 'home':    [-95.4,  93,  100.5, 19.9,  -87.1, 92.7,  2.9],
+    # 'pickup':    [-95.4,  93,  100.5, 19.9,  -266.4, 92.7,  2.9],
+    'home':    [-154,  93,  97, 29,  -90, 92,  -5],
+    'pickup':    [-139,  91,  98, 34.5,  -48, 15,  -17],
+    'engage':  [-83,  91,  97,  59,  -100,  88.9,  38.2],  
+    'retract':  [-87,  91,  95,  63,  -100,  89,  28],  
+    # 'engage':  [-2.5,  30.3,  3.6,  53.3,  49.4,  2.2,  -48],  
+    # 'retract': [-2.5,  30.3,  3.6,  53.3,  49.4,  2.2,  -48],  
+}
+
 # RMS amplitude below which audio is considered silence and skipped (0–1 scale).
 # Typical speech RMS is 0.05–0.2; background noise is usually under 0.01.
 LOUDNESS_THRESHOLD = 0.05
@@ -268,6 +287,12 @@ def parse_command(text):
     cleaned = re.sub(r'[^\w\s]', '', text.lower())
     if 'go home' in cleaned:
         return ('home', 'Go Home')
+    if 'pickup' in words or 'pick up' in cleaned:
+        return ('pickup', 'Go to Pickup')
+    if 'engage' in words:
+        return ('engage', 'Go to Engage')
+    if 'retract' in words:
+        return ('retract', 'Go to Retract')
     if 'open' in words:
         return ('gripper_open', 'Open Gripper')
     if 'close' in words:
@@ -333,7 +358,8 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
         return
 
     _PROMPT = ("move forward a little, move backward more, move left a lot, "
-               "move right slightly, move up, move down, go home, stop, open, close")
+               "move right slightly, move up, move down, go home, pickup, engage, retract, "
+               "stop, open, close")
 
     with mic as source:
         on_mic_state("Calibrating microphone…")
@@ -432,9 +458,9 @@ def execute_loop(arm, gripper, cmd_queue, stop_event, on_active, on_done, on_log
             try:
                 if cmd[0] == 'stop':
                     arm.emergency_stop()
-                elif cmd[0] == 'home':
+                elif cmd[0] in ('home', 'pickup', 'engage', 'retract'):
                     arm.set_servo_angle(
-                        angle=[-3.5, 9.4, 0, 13.9, 0, -23, 0],
+                        angle=JOINT_POSITIONS[cmd[0]],
                         speed=30, wait=True,
                     )
                 elif cmd[0] == 'move':
@@ -576,6 +602,9 @@ class VoiceControlApp:
         cmd_menu.add_command(label='"down [qualifier]"      →  -Z', state='disabled')
         cmd_menu.add_separator()
         cmd_menu.add_command(label='"go home"               →  return to home position', state='disabled')
+        cmd_menu.add_command(label='"pickup"                →  move to pickup position', state='disabled')
+        cmd_menu.add_command(label='"engage"                →  move to engage position', state='disabled')
+        cmd_menu.add_command(label='"retract"               →  move to retract position', state='disabled')
         cmd_menu.add_command(label='"stop"                  →  emergency stop',          state='disabled')
         cmd_menu.add_separator()
         cmd_menu.add_command(label='"open"                  →  open DexHand gripper',   state='disabled')
@@ -718,7 +747,10 @@ class VoiceControlApp:
             ('right [qualifier]',    '±Y  (5 / 20 / 40 / 80 mm)'),
             ('up [qualifier]',       '±Z  (5 / 20 / 40 / 80 mm)'),
             ('down [qualifier]',     '±Z  (5 / 20 / 40 / 80 mm)'),
-            ('go home',              'return to home position'),
+            ('go home',              'move to home position'),
+            ('pickup',               'move to pickup position'),
+            ('engage',               'move to engage position'),
+            ('retract',              'move to retract position'),
             ('stop',                 'emergency stop'),
             ('open',                 'open DexHand gripper'),
             ('close',                'close DexHand gripper'),
