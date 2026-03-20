@@ -1,13 +1,32 @@
-# Sytem dependencies 
+# System dependencies (Linux/Mac)
 # sudo apt install portaudio19-dev python3-tk
 
+# ── xArm SDK ──────────────────────────────────────────────────────────────
 xarm-python-sdk
-SpeechRecognition  
-pyaudio  
-PyQt5
-pyserial
-pyyaml
+
+# ── Voice control ─────────────────────────────────────────────────────────
+SpeechRecognition
+pyaudio
+faster-whisper          # preferred: INT8-quantised Whisper, 4-8x faster on CPU
+openai-whisper          # fallback: used in voice-movement-v2.py
+
+# ── Gripper (DexHand via Dynamixel) ───────────────────────────────────────
 dynamixel_sdk
+pyserial
+
+# ── GUI / audio ───────────────────────────────────────────────────────────
+PyQt5
 soundfile
-openai-whisper
-faster-whisper
+pyyaml
+
+# ── Computer vision pipeline ──────────────────────────────────────────────
+# NOTE: pyrealsense2 is NOT installable via pip on macOS.
+# Install via conda-forge in a dedicated environment instead:
+#   conda create -n surgical-cv python=3.13 -y
+#   conda activate surgical-cv
+#   conda install -c conda-forge pyrealsense2 -y
+#   pip install opencv-contrib-python numpy
+#
+# On Linux, pip install pyrealsense2 works normally.
+opencv-contrib-python   # ArUco detection + general CV (includes cv2.aruco)
+numpy
