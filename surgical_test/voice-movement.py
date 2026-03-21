@@ -1,30 +1,34 @@
 #!/usr/bin/env python3
 """
-Voice-Controlled xArm — 6-DOF Cartesian
-========================================
-Speak simple directional commands to move the end-effector.
+Voice-Controlled xArm — 6-DOF Cartesian with ArUco Calibration
+===============================================================
+Speak simple directional commands to move the end-effector,
+or say "go to incision" to move to a calibrated incision site.
 
 Voice commands:
-  "forward"   → +X  (20 mm)
-  "backward"  → -X  (20 mm)
-  "left"      → +Y  (20 mm)
-  "right"     → -Y  (20 mm)
-  "up"        → +Z  (20 mm)
-  "down"      → -Z  (20 mm)
-  "go home"   → return to home position
-  "stop"      → emergency stop
+  "forward"        → +X  (20 mm)
+  "backward"       → -X  (20 mm)
+  "left"           → +Y  (20 mm)
+  "right"          → -Y  (20 mm)
+  "up"             → +Z  (20 mm)
+  "down"           → -Z  (20 mm)
+  "go home"        → return to home position
+  "go to incision" → move to calibrated incision midpoint
+  "stop"           → emergency stop
 
 Dependencies:
-  pip install SpeechRecognition pyaudio
+  pip install SpeechRecognition pyaudio opencv-contrib-python pyrealsense2 numpy
 """
 
 import os
 import sys
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import scrolledtext, font as tkfont
 
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
 try:
@@ -33,7 +37,16 @@ except ImportError:
     print("ERROR: SpeechRecognition not installed. Run: pip install SpeechRecognition pyaudio")
     sys.exit(1)
 
+import cv2
+from PIL import Image, ImageTk
+
 from xarm.wrapper import XArmAPI
+from surgical_test.calibration import CalibrationManager
+from surgical_test.config import (
+    APPROACH_HEIGHT_MM,
+    MOTION_SPEED,
+    MOTION_SPEED_DESCEND,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +85,7 @@ def parse_command(text):
       ('move', dx, dy, dz, label)
       ('home', label)
       ('stop', label)
+      ('goto_incision', label)
       None
     """
     text = text.lower().strip()
@@ -80,6 +94,8 @@ def parse_command(text):
         return ('stop', 'Emergency Stop')
     if 'home' in text:
         return ('home', 'Go Home')
+    if 'incision' in text:
+        return ('goto_incision', 'Go to Incision')
 
     for word, (dx, dy, dz, label) in DIRECTION_MAP.items():
         if word in text:
@@ -150,7 +166,8 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
     on_mic_state("Stopped")
 
 
-def execute_loop(arm, cmd_queue, stop_event, on_active, on_done, on_log):
+def execute_loop(arm, cmd_queue, stop_event, on_active, on_done, on_log,
+                 calibration_mgr=None):
     """
     Drains cmd_queue and executes each command on the arm.
     If arm is None (demo mode), commands are logged but not sent.
@@ -167,7 +184,13 @@ def execute_loop(arm, cmd_queue, stop_event, on_active, on_done, on_log):
 
         if arm is None:
             on_log(f"[DEMO] Would execute: {label}")
-            import time; time.sleep(0.4)
+            if cmd[0] == 'goto_incision' and calibration_mgr:
+                if calibration_mgr.is_calibrated:
+                    t = calibration_mgr.incision_target
+                    on_log(f"[DEMO] Target: x={t[0]:.1f} y={t[1]:.1f} z={t[2]:.1f}")
+                else:
+                    on_log("[DEMO] Not calibrated — would be rejected.")
+            time.sleep(0.4)
         else:
             on_log(f"Executing: {label}")
             try:
@@ -175,6 +198,8 @@ def execute_loop(arm, cmd_queue, stop_event, on_active, on_done, on_log):
                     arm.emergency_stop()
                 elif cmd[0] == 'home':
                     arm.move_gohome(wait=True)
+                elif cmd[0] == 'goto_incision':
+                    _execute_goto_incision(arm, calibration_mgr, on_log)
                 elif cmd[0] == 'move':
                     _, dx, dy, dz, _ = cmd
                     arm.set_position(
@@ -191,6 +216,35 @@ def execute_loop(arm, cmd_queue, stop_event, on_active, on_done, on_log):
         on_done()
 
     on_active('—')
+
+
+def _execute_goto_incision(arm, calibration_mgr, on_log):
+    """
+    Two-step safe approach: hover above the incision, then descend.
+    """
+    if calibration_mgr is None or not calibration_mgr.is_calibrated:
+        on_log("Cannot go to incision — not calibrated.")
+        return
+
+    target = calibration_mgr.incision_target
+    x, y, z = target[0], target[1], target[2]
+    roll, pitch, yaw = target[3], target[4], target[5]
+
+    hover_z = z + APPROACH_HEIGHT_MM
+    on_log(f"Step 1/2: hover above incision at z={hover_z:.1f} mm")
+    arm.set_position(
+        x=x, y=y, z=hover_z,
+        roll=roll, pitch=pitch, yaw=yaw,
+        speed=MOTION_SPEED, wait=True,
+    )
+
+    on_log(f"Step 2/2: descend to incision at z={z:.1f} mm")
+    arm.set_position(
+        x=x, y=y, z=z,
+        roll=roll, pitch=pitch, yaw=yaw,
+        speed=MOTION_SPEED_DESCEND, wait=True,
+    )
+    on_log("Arrived at incision.")
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +314,7 @@ class VoiceControlApp:
         self.voice_thread = None
         self.exec_thread = None
         self.cmd_queue = queue.Queue()
+        self.calibration_mgr = CalibrationManager(on_log=self._log)
 
         self._build_ui()
 
@@ -306,6 +361,38 @@ class VoiceControlApp:
         self.btn_disconnect = _btn(row, "Disconnect", self._on_disconnect,
                                    C['grey'], C['grey_dk'], state='disabled')
         self.btn_disconnect.grid(row=0, column=4, padx=4)
+
+        # ── Calibration ────────────────────────────────────────────────────
+        s_out, s_in = _section(main, "ArUco Calibration")
+        s_out.pack(fill='x', pady=(4, 0), **P)
+
+        cal_row = tk.Frame(s_in, bg=C['surface'])
+        cal_row.pack(fill='x', padx=12, pady=12)
+
+        self.btn_cal_start = _btn(cal_row, "Start Camera", self._on_cal_start,
+                                  '#2563eb', '#1d4ed8', width=14)
+        self.btn_cal_start.pack(side='left', padx=(0, 8))
+
+        self.btn_cal_capture = _btn(cal_row, "Capture Markers", self._on_cal_capture,
+                                    C['grey'], C['grey_dk'], state='disabled', width=16)
+        self.btn_cal_capture.pack(side='left', padx=(0, 8))
+
+        self.btn_cal_stop = _btn(cal_row, "Stop Camera", self._on_cal_stop,
+                                 C['grey'], C['grey_dk'], state='disabled', width=14)
+        self.btn_cal_stop.pack(side='left', padx=(0, 16))
+
+        self.cal_status_var = tk.StringVar(value="Not calibrated")
+        self.cal_status_label = tk.Label(
+            cal_row, textvariable=self.cal_status_var,
+            bg=C['surface'], fg='#f87171',
+            font=('Helvetica', 11, 'bold'), anchor='w',
+        )
+        self.cal_status_label.pack(side='left', padx=8)
+
+        self._preview_image = None  # prevent garbage-collection of PhotoImage
+        self.preview_label = tk.Label(s_in, bg=C['bg'])
+        self.preview_label.pack(padx=12, pady=(0, 12))
+        self._preview_polling = False
 
         # ── Voice control ───────────────────────────────────────────────────
         s_out, s_in = _section(main, "Voice Control")
@@ -402,6 +489,7 @@ class VoiceControlApp:
             ('left / right',       f'±Y  ({STEP_MM} mm)'),
             ('up / down',          f'±Z  ({STEP_MM} mm)'),
             ('go home',            'return to home position'),
+            ('go to incision',     'move to calibrated incision site'),
             ('stop',               'emergency stop'),
         ]
         ref_grid = tk.Frame(ref_in, bg=C['surface'])
@@ -442,6 +530,8 @@ class VoiceControlApp:
                 self.active_label.config(bg=C['red_dk'])
             elif 'Home' in label or 'home' in label:
                 self.active_label.config(bg=C['blue_dk'])
+            elif 'Incision' in label or 'incision' in label:
+                self.active_label.config(bg='#7c3aed')
             else:
                 self.active_label.config(bg=C['green_dk'])
         self.root.after(0, _update)
@@ -556,7 +646,8 @@ class VoiceControlApp:
         self.exec_thread = threading.Thread(
             target=execute_loop,
             args=(self.arm, self.cmd_queue, self.stop_event,
-                  self._set_active, self._on_cmd_done, self._log),
+                  self._set_active, self._on_cmd_done, self._log,
+                  self.calibration_mgr),
             daemon=True,
         )
         self.voice_thread.start()
@@ -587,10 +678,77 @@ class VoiceControlApp:
             except queue.Empty:
                 break
 
+    # --- Calibration callbacks ------------------------------------------------
+
+    def _on_cal_start(self):
+        """Open the depth camera and begin the calibration preview."""
+        def _start():
+            try:
+                self.calibration_mgr.start_camera()
+                self.root.after(0, self._start_preview_polling)
+                self.root.after(0, lambda: self.btn_cal_start.config(state='disabled'))
+                self.root.after(0, lambda: self.btn_cal_capture.config(state='normal', bg=C['green']))
+                self.root.after(0, lambda: self.btn_cal_stop.config(state='normal', bg=C['grey']))
+            except Exception as e:
+                self._log(f"Camera failed: {e}")
+        threading.Thread(target=_start, daemon=True).start()
+
+    def _start_preview_polling(self):
+        """Begin polling the calibration manager for new frames."""
+        self._preview_polling = True
+        self._poll_preview()
+
+    def _poll_preview(self):
+        """Called on the main thread via root.after(); updates the preview label."""
+        if not self._preview_polling:
+            return
+        frame = self.calibration_mgr.get_last_frame()
+        if frame is not None:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w = frame_rgb.shape[:2]
+            max_w = 480
+            if w > max_w:
+                scale = max_w / w
+                frame_rgb = cv2.resize(frame_rgb, (max_w, int(h * scale)))
+            img = Image.fromarray(frame_rgb)
+            self._preview_image = ImageTk.PhotoImage(image=img)
+            self.preview_label.config(image=self._preview_image)
+        self.root.after(33, self._poll_preview)  # ~30 fps
+
+    def _stop_preview_polling(self):
+        """Stop the preview polling loop and clear the preview image."""
+        self._preview_polling = False
+        self.preview_label.config(image='')
+        self._preview_image = None
+
+    def _on_cal_capture(self):
+        """Capture averaged marker poses and compute the incision target."""
+        def _capture():
+            ok = self.calibration_mgr.capture()
+            def _update_ui():
+                if ok:
+                    self.cal_status_var.set("Calibrated")
+                    self.cal_status_label.config(fg='#4ade80')
+                else:
+                    self.cal_status_var.set("Calibration failed")
+                    self.cal_status_label.config(fg='#f87171')
+            self.root.after(0, _update_ui)
+        threading.Thread(target=_capture, daemon=True).start()
+
+    def _on_cal_stop(self):
+        """Stop the camera — markers can now be removed."""
+        self._stop_preview_polling()
+        self.calibration_mgr.stop_camera()
+        self.btn_cal_start.config(state='normal', bg='#2563eb')
+        self.btn_cal_capture.config(state='disabled', bg=C['grey_dk'])
+        self.btn_cal_stop.config(state='disabled', bg=C['grey_dk'])
+
     def _on_arm_error(self, item):
         self._log(f"Arm error/warn — code={item.get('error_code')} warn={item.get('warn_code')}")
 
     def _on_close(self):
+        self._stop_preview_polling()
+        self.calibration_mgr.stop_camera()
         self._on_disconnect()
         self.root.destroy()
 
