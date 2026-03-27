@@ -1,0 +1,13 @@
+import pyrealsense2 as rs
+print("starting pipeline...")
+p = rs.pipeline()
+c = rs.config()
+c.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+print("starting stream...")
+p.start(c)
+print("waiting for frames...")
+f = p.wait_for_frames()
+print("got frames")
+d = f.get_depth_frame()
+print("depth ok, center =", d.get_distance(320, 240), "m")
+p.stop()
