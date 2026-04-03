@@ -11,3 +11,6 @@ example/wrapper/robot.conf
 bak-xarm/
 .vscode/
 venv/
+venv311/
+__pycache__/
+*.pyc
