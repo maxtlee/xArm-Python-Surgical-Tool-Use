@@ -39,7 +39,7 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 ARUCO_DICT_ID  = cv2.aruco.DICT_4X4_50
-MARKER_IDS     = [0, 1]
+MARKER_IDS     = [0, 1, 2]
 
 # Output image size in pixels. 400px gives a crisp image at any print size.
 MARKER_PX      = 400
@@ -89,7 +89,12 @@ def add_label(img: np.ndarray, marker_id: int) -> np.ndarray:
     Add a human-readable label below the marker indicating its ID and role.
     This makes it easy to tell which printout to place at which end.
     """
-    role = "START (end 0)" if marker_id == 0 else "END   (end 1)"
+    if marker_id == 0:
+        role = "START (end 0)"
+    elif marker_id == 1:
+        role = "END   (end 1)"
+    else:
+        role = f"AUX   (id  {marker_id})"
     label = f"ID {marker_id}  —  {role}  —  DICT_4X4_50"
 
     # Convert to BGR so we can draw coloured text
