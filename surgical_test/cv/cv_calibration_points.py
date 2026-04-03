@@ -247,8 +247,8 @@ class MarkerStabilityTracker:
 def draw_banner(frame, text, color_bgr):
     """Draw a filled banner at top of frame."""
     h, w = frame.shape[:2]
-    cv2.rectangle(frame, (0, 0), (w, 36), color_bgr, -1)
-    cv2.putText(frame, text, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.rectangle(frame, (0, 0), (w, 28), color_bgr, -1)
+    cv2.putText(frame, text, (8, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (255, 255, 255), 1)
 
 
 def run():
@@ -262,10 +262,22 @@ def run():
     pts_arm  = []   # metres, arm base frame
     click_pt = {"x": None, "y": None}
     last_depth = {"arr": None}
+    used_marker_ids = set()  # markers already recorded, excluded from auto-capture
+    pending_cam_pt = {"pt": None, "desc": None}  # camera 3D locked on click, waiting for arm SPACE
 
     def on_mouse(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
             click_pt["x"], click_pt["y"] = x, y
+            # Immediately lock the camera 3D from this click
+            pt = pixel_to_3d(last_depth["arr"], intr, x, y)
+            if pt is not None:
+                pending_cam_pt["pt"]   = pt
+                pending_cam_pt["desc"] = f"click ({x}, {y})"
+                print(f"[calibration] Camera point locked: cam=({pt[0]:.4f}, {pt[1]:.4f}, {pt[2]:.4f}) m")
+                print(f"[calibration] Now move TCP to that location and press SPACE.")
+            else:
+                pending_cam_pt["pt"] = None
+                print("[calibration] No depth at click — try again.")
 
     cv2.namedWindow("Point Calibration")
     cv2.setMouseCallback("Point Calibration", on_mouse)
@@ -274,13 +286,12 @@ def run():
     print("  For M0/M1:   touch TCP to marker center — green banner shows when stable.")
     print("               Press SPACE to auto-record (no click needed).")
     print("  For others:  LEFT-CLICK on TCP location in image, then press SPACE.")
-    print("  C  = compute transform (need ≥4 non-coplanar points)")
+    print("  C  = compute transform (need ≥3 points)")
     print("  ESC/q = quit")
     print(f"\n  Suggested sequence:")
     print(f"    Point 1 — TCP to M0 center  (auto)")
     print(f"    Point 2 — TCP to M1 center  (auto)")
-    print(f"    Point 3 — TCP to a surface corner  (click)")
-    print(f"    Point 4 — TCP ~150mm above M0  (click — breaks coplanar degeneracy)\n")
+    print(f"    Point 3 — TCP ~150mm above M0  (click — breaks coplanar degeneracy)\n")
 
     try:
         while True:
@@ -292,27 +303,19 @@ def run():
             centers = detect_markers(color, bundle)
             tracker.update(centers)
 
-            spots = []
-            if MARKER_START_ID in centers and MARKER_END_ID in centers:
-                spots = compute_spots(centers[MARKER_START_ID], centers[MARKER_END_ID])
-
-            # ---- Draw marker/spot overlay ----
+            # ---- Draw marker overlay ----
             for mid, (cx, cy) in centers.items():
                 stable = tracker.is_stable(mid)
                 dot_color = (0, 255, 0) if stable else (0, 180, 0)
                 cv2.circle(color, (int(cx), int(cy)), 8, dot_color, -1)
                 label = f"M{mid} {'STABLE' if stable else ''}"
                 cv2.putText(color, label, (int(cx)+10, int(cy)-10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, dot_color, 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.43, dot_color, 1)
 
             if MARKER_START_ID in centers and MARKER_END_ID in centers:
                 pa = tuple(int(v) for v in centers[MARKER_START_ID])
                 pb = tuple(int(v) for v in centers[MARKER_END_ID])
-                cv2.line(color, pa, pb, (0,0,255), 2)
-                for i, (sx, sy) in enumerate(spots):
-                    cv2.circle(color, (int(sx), int(sy)), 10, (255,100,0), -1)
-                    cv2.putText(color, f"S{i+1}", (int(sx)+13, int(sy)+5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2)
+                cv2.line(color, pa, pb, (0, 0, 255), 2)
 
             # ---- Draw click crosshair ----
             if click_pt["x"] is not None:
@@ -321,7 +324,7 @@ def run():
                                cv2.MARKER_CROSS, 20, 2)
                 d = get_depth_at_pixel(depth, cx, cy)
                 cv2.putText(color, f"depth={d*1000:.0f}mm", (cx+12, cy-8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,255), 1)
 
             # ---- Draw previously recorded points ----
             for i, pc in enumerate(pts_cam):
@@ -332,8 +335,8 @@ def run():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,255), 1)
 
             # ---- Banner: auto-mode vs click-mode ----
-            stable_ids = tracker.stable_markers()
-            # Determine if current click is near a stable marker
+            stable_ids = [m for m in tracker.stable_markers() if m not in used_marker_ids]
+            # Determine if current click is near a stable unused marker
             auto_marker_id = None
             if click_pt["x"] is not None and stable_ids:
                 for mid in stable_ids:
@@ -343,21 +346,24 @@ def run():
                         if dist < CLICK_MARKER_RADIUS:
                             auto_marker_id = mid
                             break
-            # If no click yet but exactly one stable marker → auto mode
+            # If no click yet but exactly one stable unused marker → auto mode
             if click_pt["x"] is None and len(stable_ids) == 1:
                 auto_marker_id = stable_ids[0]
 
-            if stable_ids:
+            if pending_cam_pt["pt"] is not None:
+                banner_text  = "Camera pt locked | move TCP to that spot, press SPACE"
+                banner_color = (180, 80, 0)  # orange
+            elif stable_ids:
                 stable_str = ", ".join(f"M{m}" for m in stable_ids)
                 if auto_marker_id is not None:
-                    banner_text  = f"AUTO: {stable_str} stable — touch TCP to marker, press SPACE"
+                    banner_text  = f"AUTO: {stable_str} stable | TCP to marker, press SPACE"
                     banner_color = (30, 140, 30)  # green
                 else:
-                    banner_text  = f"Marker {stable_str} stable — click non-marker TCP location, press SPACE"
+                    banner_text  = f"Stable: {stable_str} | click target, move TCP there, press SPACE"
                     banner_color = (30, 110, 140)  # teal
             else:
-                banner_text  = "No stable marker — click TCP location in image, then press SPACE"
-                banner_color = (30, 100, 180)  # yellow-ish
+                banner_text  = "Click target in image, move TCP there, press SPACE"
+                banner_color = (30, 100, 180)  # blue
 
             draw_banner(color, banner_text, banner_color)
 
@@ -378,18 +384,19 @@ def run():
                 # 1. Auto: click near stable marker OR single stable marker with no click
                 use_marker_id = None
 
+                available = [m for m in tracker.stable_markers() if m not in used_marker_ids]
                 if click_pt["x"] is not None:
-                    # Check if click is near a stable marker
-                    for mid in tracker.stable_markers():
+                    # Check if click is near a stable unused marker
+                    for mid in available:
                         sc = tracker.stable_center(mid)
                         if sc:
                             dist = np.hypot(click_pt["x"] - sc[0], click_pt["y"] - sc[1])
                             if dist < CLICK_MARKER_RADIUS:
                                 use_marker_id = mid
                                 break
-                elif len(tracker.stable_markers()) == 1:
-                    # No click, single stable marker → auto
-                    use_marker_id = tracker.stable_markers()[0]
+                elif len(available) == 1:
+                    # No click, single stable unused marker → auto
+                    use_marker_id = available[0]
 
                 # ---- Get arm position ----
                 code, pos = arm.get_position(is_radian=False)
@@ -401,23 +408,24 @@ def run():
                 arm_m  = arm_mm / 1000.0
 
                 # ---- Get camera 3D ----
-                if use_marker_id is not None:
+                # Priority: pre-locked click pt → auto ArUco → no source
+                if pending_cam_pt["pt"] is not None:
+                    pt_cam   = pending_cam_pt["pt"]
+                    src_desc = pending_cam_pt["desc"]
+                    pending_cam_pt["pt"] = None
+                    click_pt["x"] = click_pt["y"] = None
+                elif use_marker_id is not None:
                     sc = tracker.stable_center(use_marker_id)
                     pt_cam = pixel_to_3d(last_depth["arr"], intr, sc[0], sc[1])
                     src_desc = f"ArUco M{use_marker_id} center (auto)"
-                    click_pt["x"] = click_pt["y"] = None
-                elif click_pt["x"] is not None:
-                    pt_cam = pixel_to_3d(last_depth["arr"], intr, click_pt["x"], click_pt["y"])
-                    src_desc = f"click ({click_pt['x']}, {click_pt['y']})"
-                    click_pt["x"] = click_pt["y"] = None
+                    tracker._history.pop(use_marker_id, None)
+                    used_marker_ids.add(use_marker_id)
                 else:
-                    print("[calibration] No click and multiple (or zero) stable markers visible.")
-                    print("             Click the TCP location in the image, or ensure only")
-                    print("             one marker is stable.")
+                    print("[calibration] Click on the target location first, then press SPACE.")
                     continue
 
                 if pt_cam is None:
-                    print("[calibration] No depth at that location — try a different spot.")
+                    print("[calibration] No depth at that location — try again.")
                     continue
 
                 pts_cam.append(pt_cam)
@@ -428,8 +436,8 @@ def run():
                 print(f"  cam  (m): ({pt_cam[0]:.4f}, {pt_cam[1]:.4f}, {pt_cam[2]:.4f})")
 
             elif key == ord("c"):
-                if len(pts_cam) < 4:
-                    print(f"[calibration] Need ≥4 points (have {len(pts_cam)}).")
+                if len(pts_cam) < 3:
+                    print(f"[calibration] Need ≥3 points (have {len(pts_cam)}).")
                     continue
 
                 T = solve_transform(pts_cam, pts_arm)

@@ -70,7 +70,7 @@ END_EFFECTOR_PITCH = -90 # degrees — keep end-effector pointing straight down
 # Home joint angles (degrees) — same as in voice-movement.py
 HOME_JOINTS = [0, -45, 0, 45, 0, 90, 0]
 
-DEFAULT_ARM_IP = "192.168.1.113"
+DEFAULT_ARM_IP = "192.168.1.195"
 
 CALIB_PATH = os.path.join(os.path.dirname(__file__), "T_cam_to_base.npy")
 
