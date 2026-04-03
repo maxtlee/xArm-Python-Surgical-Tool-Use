@@ -48,11 +48,11 @@ except ImportError:
     print("ERROR: xarm package not found"); sys.exit(1)
 
 # ---------------------------------------------------------------------------
-STREAM_W, STREAM_H, STREAM_FPS = 640, 480, 30
+STREAM_W, STREAM_H, STREAM_FPS = 640, 480, 15
 ARUCO_DICT_ID   = cv2.aruco.DICT_4X4_50
 MARKER_START_ID = 0
 MARKER_END_ID   = 1
-NUM_SPOTS       = 4
+NUM_SPOTS       = 2
 DEFAULT_ARM_IP  = "192.168.1.195"
 OUTPUT_PATH     = os.path.join(os.path.dirname(__file__), "T_cam_to_base.npy")
 
@@ -86,7 +86,8 @@ def open_realsense():
     config.enable_stream(rs.stream.color, STREAM_W, STREAM_H, rs.format.bgr8, STREAM_FPS)
     config.enable_stream(rs.stream.depth, STREAM_W, STREAM_H, rs.format.z16,  STREAM_FPS)
     pipeline.start(config)
-    frames      = pipeline.wait_for_frames()
+    time.sleep(3.0)   # warm-up: let the devicex stabilise before grabbing first frame
+    frames      = pipeline.wait_for_frames(10000)
     color_frame = frames.get_color_frame()
     intr        = color_frame.profile.as_video_stream_profile().get_intrinsics()
     intr_dict   = {"fx": intr.fx, "fy": intr.fy, "ppx": intr.ppx, "ppy": intr.ppy}
@@ -128,7 +129,13 @@ def pixel_to_3d(depth, intr, x, y):
 def build_detector():
     dictionary = cv2.aruco.getPredefinedDictionary(ARUCO_DICT_ID)
     if hasattr(cv2.aruco, "ArucoDetector"):
-        detector = cv2.aruco.ArucoDetector(dictionary, cv2.aruco.DetectorParameters())
+        params = cv2.aruco.DetectorParameters()
+        params.adaptiveThreshWinSizeMin = 3
+        params.adaptiveThreshWinSizeMax = 23
+        params.adaptiveThreshWinSizeStep = 4
+        params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        params.minMarkerPerimeterRate = 0.03
+        detector = cv2.aruco.ArucoDetector(dictionary, params)
         return detector, dictionary, "new"
     return None, dictionary, cv2.aruco.DetectorParameters_create()
 
@@ -251,6 +258,52 @@ def draw_banner(frame, text, color_bgr):
     cv2.putText(frame, text, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
 
+def draw_pose_panel(pts_arm, pts_cam, labels, panel_w=300):
+    """
+    Build a dark sidebar showing all recorded calibration points.
+    Returns a (STREAM_H, panel_w, 3) image.
+    """
+    panel = np.zeros((STREAM_H, panel_w, 3), dtype=np.uint8)
+    panel[:] = (30, 30, 30)
+
+    cv2.putText(panel, "Recorded Points", (8, 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    cv2.line(panel, (0, 30), (panel_w, 30), (80, 80, 80), 1)
+
+    if not pts_arm:
+        cv2.putText(panel, "none yet", (8, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120, 120, 120), 1)
+        return panel
+
+    y = 50
+    for i, (pa, pc, lbl) in enumerate(zip(pts_arm, pts_cam, labels)):
+        arm_mm = pa * 1000
+        # point header
+        header = f"#{i+1}  {lbl}"
+        cv2.putText(panel, header, (8, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (100, 220, 100), 1)
+        y += 18
+        # arm position
+        arm_txt = f"arm: {arm_mm[0]:.0f}, {arm_mm[1]:.0f}, {arm_mm[2]:.0f} mm"
+        cv2.putText(panel, arm_txt, (12, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 180), 1)
+        y += 15
+        # camera position
+        cam_txt = f"cam: {pc[0]*1000:.0f}, {pc[1]*1000:.0f}, {pc[2]*1000:.0f} mm"
+        cv2.putText(panel, cam_txt, (12, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (140, 180, 220), 1)
+        y += 15
+        cv2.line(panel, (8, y), (panel_w-8, y), (60, 60, 60), 1)
+        y += 8
+
+        if y > STREAM_H - 30:
+            break
+
+    cv2.putText(panel, f"Total: {len(pts_arm)}", (8, STREAM_H - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1)
+    return panel
+
+
 def run():
     ip  = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_ARM_IP
     arm = connect_arm(ip)
@@ -260,6 +313,7 @@ def run():
 
     pts_cam  = []   # metres, camera frame
     pts_arm  = []   # metres, arm base frame
+    pt_labels = []  # display label for each point (e.g. "M0 auto", "click")
     click_pt = {"x": None, "y": None}
     last_depth = {"arr": None}
 
@@ -363,10 +417,14 @@ def run():
 
             n = len(pts_cam)
             cv2.putText(color,
-                        f"Points recorded: {n} | C=compute  ESC=quit",
+                        f"Points: {n} | SPACE=record  C=compute  ESC=quit",
                         (10, STREAM_H - 10), cv2.FONT_HERSHEY_SIMPLEX,
                         0.5, (200,200,200), 1)
-            cv2.imshow("Point Calibration", color)
+
+            # ---- Sidebar panel ----
+            panel = draw_pose_panel(pts_arm, pts_cam, pt_labels)
+            combined = np.hstack([color, panel])
+            cv2.imshow("Point Calibration", combined)
 
             key = cv2.waitKey(1) & 0xFF
 
@@ -405,10 +463,12 @@ def run():
                     sc = tracker.stable_center(use_marker_id)
                     pt_cam = pixel_to_3d(last_depth["arr"], intr, sc[0], sc[1])
                     src_desc = f"ArUco M{use_marker_id} center (auto)"
+                    label = f"M{use_marker_id} auto"
                     click_pt["x"] = click_pt["y"] = None
                 elif click_pt["x"] is not None:
                     pt_cam = pixel_to_3d(last_depth["arr"], intr, click_pt["x"], click_pt["y"])
                     src_desc = f"click ({click_pt['x']}, {click_pt['y']})"
+                    label = "click"
                     click_pt["x"] = click_pt["y"] = None
                 else:
                     print("[calibration] No click and multiple (or zero) stable markers visible.")
@@ -422,6 +482,7 @@ def run():
 
                 pts_cam.append(pt_cam)
                 pts_arm.append(arm_m)
+                pt_labels.append(label)
 
                 print(f"[calibration] Point {n+1} recorded ({src_desc}):")
                 print(f"  arm (mm): ({arm_mm[0]:.1f}, {arm_mm[1]:.1f}, {arm_mm[2]:.1f})")

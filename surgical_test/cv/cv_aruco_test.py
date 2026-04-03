@@ -79,7 +79,7 @@ MARKER_END_ID   = 1   # placed at the other end
 # Number of target spots evenly distributed between the two markers.
 # Spots are placed at positions 1/(2n), 3/(2n), … along the line so they are
 # centred in each equal segment rather than sitting on the endpoints.
-NUM_SPOTS = 4
+NUM_SPOTS = 2
 
 # Drawing colours (BGR)
 COLOR_LINE   = (0,   0,   255)  # red  — line between markers
@@ -207,7 +207,13 @@ def build_aruco_detector(dict_id: int):
 
     # OpenCV 4.7+ uses ArucoDetector; older versions use detectMarkers directly.
     if hasattr(cv2.aruco, "ArucoDetector"):
-        params   = cv2.aruco.DetectorParameters()
+        params = cv2.aruco.DetectorParameters()
+        # More stable detection: larger adaptive threshold window, more corner refinement
+        params.adaptiveThreshWinSizeMin = 3
+        params.adaptiveThreshWinSizeMax = 23
+        params.adaptiveThreshWinSizeStep = 4
+        params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        params.minMarkerPerimeterRate = 0.03
         detector = cv2.aruco.ArucoDetector(dictionary, params)
         return detector, dictionary, "new"
     else:
