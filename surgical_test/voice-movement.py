@@ -10,20 +10,35 @@ Step sizes:
   "more" / "further" / "a bit more"  →  40 mm
   "a lot" / "much" / "way"           →  80 mm
 
+Translation step sizes:
+  "a little" / "slightly" / "small"  →   5 mm
+  (no qualifier)                      →  20 mm
+  "more" / "further"                  →  40 mm
+  "a lot" / "much" / "way"           →  80 mm
+
+Rotation step sizes:
+  "a little" / "slightly" / "small"  →   2°
+  (no qualifier)                      →  10°
+  "more" / "further"                  →  20°
+  "a lot" / "much" / "way"           →  45°
+
 Voice commands:
-  "forward [qualifier]"   → +X
-  "backward [qualifier]"  → -X
-  "left [qualifier]"      → +Y
-  "right [qualifier]"     → -Y
-  "up [qualifier]"        → +Z
-  "down [qualifier]"      → -Z
-  "go home"               → return to home position
-  "pickup"                → move to pickup position
-  "engage"                → move to engage position
-  "retract"               → move to retract position
-  "stop"                  → emergency stop
-  "open"                  → open DexHand gripper
-  "close"                 → close DexHand gripper
+  "forward [qualifier]"        → +X
+  "backward [qualifier]"       → -X
+  "left [qualifier]"           → +Y
+  "right [qualifier]"          → -Y
+  "up [qualifier]"             → +Z
+  "down [qualifier]"           → -Z
+  "roll left/right [qualifier]"  → ±Roll
+  "pitch up/down [qualifier]"    → ±Pitch
+  "yaw left/right [qualifier]"   → ±Yaw
+  "go home"                    → return to home position
+  "pickup"                     → move to pickup position
+  "engage"                     → move to engage position
+  "retract"                    → move to retract position
+  "stop"                       → emergency stop
+  "open"                       → open DexHand gripper
+  "close"                      → close DexHand gripper
 
 Dependencies:
   pip install SpeechRecognition pyaudio openai-whisper dynamixel-sdk
@@ -250,6 +265,30 @@ DIRECTION_MAP = {
     'down':     ( 0,  0, -1, 'Down     −Z'),
 }
 
+# Step sizes for rotation commands (degrees)
+ROT_STEP = {
+    'little':  2,
+    'normal': 10,
+    'more':   20,
+    'lot':    45,
+}
+
+# Maps rotation axis keyword → (axis_index, positive_words, negative_words,
+#                                positive_label, negative_label)
+# Checked before DIRECTION_MAP so "yaw left" / "roll right" don't fall through
+# to the translational "left" / "right" handlers.
+ROTATION_MAP = {
+    'roll':  (0, {'left',  'counterclockwise', 'ccw'},
+                 {'right', 'clockwise',        'cw'},
+                 'Roll Left   +Roll', 'Roll Right  −Roll'),
+    'pitch': (1, {'up',    'forward'},
+                 {'down',  'backward',         'back'},
+                 'Pitch Up    +Pitch', 'Pitch Down  −Pitch'),
+    'yaw':   (2, {'left',  'counterclockwise', 'ccw'},
+                 {'right', 'clockwise',        'cw'},
+                 'Yaw Left    +Yaw',  'Yaw Right   −Yaw'),
+}
+
 
 def _read_ip_from_conf():
     """Read the robot IP from example/wrapper/robot.conf, returning '' on failure."""
@@ -274,6 +313,17 @@ def _detect_magnitude(words):
     return STEP['normal']
 
 
+def _detect_rot_magnitude(words):
+    """Return the rotation step size (degrees) based on qualifier words."""
+    if words & LOT_WORDS:
+        return ROT_STEP['lot']
+    if words & MORE_WORDS:
+        return ROT_STEP['more']
+    if words & LITTLE_WORDS:
+        return ROT_STEP['little']
+    return ROT_STEP['normal']
+
+
 def _tokenize(text):
     """Lowercase and strip punctuation, return a set of words."""
     return set(re.sub(r'[^\w\s]', '', text.lower()).split())
@@ -284,7 +334,8 @@ def parse_command(text):
     Parses natural-language commands with optional magnitude qualifiers.
 
     Returns one of:
-      ('move', dx, dy, dz, label)  — scaled by detected magnitude
+      ('move',   dx, dy, dz, label)          — translation, mm
+      ('rotate', droll, dpitch, dyaw, label) — rotation, degrees
       ('home', label)
       ('stop', label)
       ('gripper_open', label)
@@ -309,6 +360,21 @@ def parse_command(text):
         return ('gripper_open', 'Open Gripper')
     if 'close' in words:
         return ('gripper_close', 'Close Gripper')
+
+    # Rotation commands — checked before DIRECTION_MAP so that compound phrases
+    # like "yaw left" or "roll right" don't resolve as translational moves.
+    for axis_word, (axis_idx, pos_words, neg_words, pos_label, neg_label) in ROTATION_MAP.items():
+        if axis_word in words:
+            step = _detect_rot_magnitude(words)
+            sign = -1 if words & neg_words else +1
+            drot = [0, 0, 0]
+            drot[axis_idx] = sign * step
+            rot_label = neg_label if sign < 0 else pos_label
+            mag_names = {ROT_STEP['little']: 'a little', ROT_STEP['normal']: '',
+                         ROT_STEP['more']: 'more', ROT_STEP['lot']: 'a lot'}
+            qualifier = mag_names.get(step, '')
+            label = f"{rot_label}  {qualifier}({step}°)".strip()
+            return ('rotate', drot[0], drot[1], drot[2], label)
 
     for keyword, (ux, uy, uz, base_label) in DIRECTION_MAP.items():
         if keyword in words:
@@ -370,8 +436,9 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
         return
 
     _PROMPT = ("move forward a little, move backward more, move left a lot, "
-               "move right slightly, move up, move down, go home, pickup, engage, retract, "
-               "stop, open, close")
+               "move right slightly, move up, move down, "
+               "roll left, roll right a little, pitch up more, pitch down, yaw left, yaw right a lot, "
+               "go home, pickup, engage, retract, stop, open, close")
 
     with mic as source:
         on_mic_state("Calibrating microphone…")
@@ -480,6 +547,15 @@ def execute_loop(arm, gripper, cmd_queue, stop_event, on_active, on_done, on_log
                     arm.set_position(
                         x=dx, y=dy, z=dz,
                         roll=0, pitch=0, yaw=0,
+                        relative=True,
+                        speed=SPEED,
+                        wait=True,
+                    )
+                elif cmd[0] == 'rotate':
+                    _, droll, dpitch, dyaw, _ = cmd
+                    arm.set_position(
+                        x=0, y=0, z=0,
+                        roll=droll, pitch=dpitch, yaw=dyaw,
                         relative=True,
                         speed=SPEED,
                         wait=True,
@@ -605,14 +681,19 @@ class VoiceControlApp:
                            bg=C['surface'], fg=C['text'],
                            activebackground='#C41230', activeforeground=C['text'],
                            relief='flat', bd=0, font=('Courier', 12))
-        cmd_menu.add_command(label='Qualifiers:  (none) = 20 mm  |  a little = 5 mm  |  more = 40 mm  |  a lot = 80 mm', state='disabled')
+        cmd_menu.add_command(label='Translation qualifiers:  (none) = 20 mm  |  a little = 5 mm  |  more = 40 mm  |  a lot = 80 mm', state='disabled')
+        cmd_menu.add_command(label='Rotation qualifiers:    (none) = 10°    |  a little = 2°    |  more = 20°    |  a lot = 45°',    state='disabled')
         cmd_menu.add_separator()
-        cmd_menu.add_command(label='"forward [qualifier]"   →  +X', state='disabled')
-        cmd_menu.add_command(label='"backward [qualifier]"  →  -X', state='disabled')
-        cmd_menu.add_command(label='"left [qualifier]"      →  +Y', state='disabled')
-        cmd_menu.add_command(label='"right [qualifier]"     →  -Y', state='disabled')
-        cmd_menu.add_command(label='"up [qualifier]"        →  +Z', state='disabled')
-        cmd_menu.add_command(label='"down [qualifier]"      →  -Z', state='disabled')
+        cmd_menu.add_command(label='"forward [qualifier]"          →  +X', state='disabled')
+        cmd_menu.add_command(label='"backward [qualifier]"         →  -X', state='disabled')
+        cmd_menu.add_command(label='"left [qualifier]"             →  +Y', state='disabled')
+        cmd_menu.add_command(label='"right [qualifier]"            →  -Y', state='disabled')
+        cmd_menu.add_command(label='"up [qualifier]"               →  +Z', state='disabled')
+        cmd_menu.add_command(label='"down [qualifier]"             →  -Z', state='disabled')
+        cmd_menu.add_separator()
+        cmd_menu.add_command(label='"roll left/right [qualifier]"  →  ±Roll', state='disabled')
+        cmd_menu.add_command(label='"pitch up/down [qualifier]"    →  ±Pitch', state='disabled')
+        cmd_menu.add_command(label='"yaw left/right [qualifier]"   →  ±Yaw',  state='disabled')
         cmd_menu.add_separator()
         cmd_menu.add_command(label='"go home"               →  return to home position', state='disabled')
         cmd_menu.add_command(label='"pickup"                →  move to pickup position', state='disabled')
@@ -783,19 +864,22 @@ class VoiceControlApp:
         ref_out.pack(fill='x', pady=(0, 16), **P)
 
         commands = [
-            ('forward [qualifier]',  '±X  (5 / 20 / 40 / 80 mm)'),
-            ('backward [qualifier]', '±X  (5 / 20 / 40 / 80 mm)'),
-            ('left [qualifier]',     '±Y  (5 / 20 / 40 / 80 mm)'),
-            ('right [qualifier]',    '±Y  (5 / 20 / 40 / 80 mm)'),
-            ('up [qualifier]',       '±Z  (5 / 20 / 40 / 80 mm)'),
-            ('down [qualifier]',     '±Z  (5 / 20 / 40 / 80 mm)'),
-            ('go home',              'move to home position'),
-            ('pickup',               'move to pickup position'),
-            ('engage',               'move to engage position'),
-            ('retract',              'move to retract position'),
-            ('stop',                 'emergency stop'),
-            ('open',                 'open DexHand gripper'),
-            ('close',                'close DexHand gripper'),
+            ('forward [qualifier]',         '±X  (5 / 20 / 40 / 80 mm)'),
+            ('backward [qualifier]',        '±X  (5 / 20 / 40 / 80 mm)'),
+            ('left [qualifier]',            '±Y  (5 / 20 / 40 / 80 mm)'),
+            ('right [qualifier]',           '±Y  (5 / 20 / 40 / 80 mm)'),
+            ('up [qualifier]',              '±Z  (5 / 20 / 40 / 80 mm)'),
+            ('down [qualifier]',            '±Z  (5 / 20 / 40 / 80 mm)'),
+            ('roll left/right [qualifier]', '±Roll  (2 / 10 / 20 / 45°)'),
+            ('pitch up/down [qualifier]',   '±Pitch  (2 / 10 / 20 / 45°)'),
+            ('yaw left/right [qualifier]',  '±Yaw   (2 / 10 / 20 / 45°)'),
+            ('go home',                     'move to home position'),
+            ('pickup',                      'move to pickup position'),
+            ('engage',                      'move to engage position'),
+            ('retract',                     'move to retract position'),
+            ('stop',                        'emergency stop'),
+            ('open',                        'open DexHand gripper'),
+            ('close',                       'close DexHand gripper'),
         ]
         ref_grid = tk.Frame(ref_in, bg=C['surface'])
         ref_grid.pack(fill='x', padx=12, pady=10)
