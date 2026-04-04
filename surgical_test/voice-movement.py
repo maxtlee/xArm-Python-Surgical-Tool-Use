@@ -206,8 +206,20 @@ JOINT_POSITIONS = {
     'pickup':    [-139,  91,  98, 34.5,  -48, 15,  -17],
     'engage':  [-83,  91,  97,  59,  -100,  88.9,  38.2],  
     'retract':  [-87,  91,  95,  63,  -100,  89,  28],  
-    # 'engage':  [-2.5,  30.3,  3.6,  53.3,  49.4,  2.2,  -48],  
-    # 'retract': [-2.5,  30.3,  3.6,  53.3,  49.4,  2.2,  -48],  
+    # 'engage':  [-2.5,  30.3,  3.6,  53.3,  49.4,  2.2,  -48],
+    # 'retract': [-2.5,  30.3,  3.6,  53.3,  49.4,  2.2,  -48],
+}
+
+# TCP offsets per tool: [x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg]
+# Measured from the 7th-joint flange centre to the tool tip.
+# All values are placeholders — calibrate for each physical tool.
+TOOL_OFFSETS = {
+    'None (flange)':  [  0,   0,   0,   0,  0,  0],
+    'Retractor':      [  0,   0, 150,   0,  0,  0],
+    'Scissors':       [  0,   0, 180,   0,  0,  0],
+    'Forceps':        [  0,   0, 200,   0,  0,  0],
+    'Needle Driver':  [  0,   0, 195,   0,  0,  0],
+    'Cautery Hook':   [  0,   0, 170,  15,  0,  0],
 }
 
 # RMS amplitude below which audio is considered silence and skipped (0–1 scale).
@@ -563,6 +575,7 @@ class VoiceControlApp:
         self.voice_thread = None
         self.exec_thread = None
         self.cmd_queue = queue.Queue()
+        self.tool_var = tk.StringVar(value=next(iter(TOOL_OFFSETS)))
 
         # Attempt to connect to the DexHand gripper at startup
         try:
@@ -649,6 +662,35 @@ class VoiceControlApp:
         self.btn_disconnect = _btn(row, "Disconnect", self._on_disconnect,
                                    C['grey'], C['grey_dk'], state='disabled')
         self.btn_disconnect.grid(row=0, column=4, padx=4)
+
+        # ── Tool TCP Offset ──────────────────────────────────────────────────
+        t_out, t_in = _section(main, "Tool TCP Offset")
+        t_out.pack(fill='x', pady=(4, 0), **P)
+
+        trow = tk.Frame(t_in, bg=C['surface'])
+        trow.pack(fill='x', padx=12, pady=10)
+
+        tk.Label(trow, text="Active tool", bg=C['surface'], fg=C['subtext'],
+                 font=('Helvetica', 11)).grid(row=0, column=0, sticky='w', padx=(0, 8))
+
+        tool_menu = tk.OptionMenu(trow, self.tool_var, *TOOL_OFFSETS.keys(),
+                                  command=self._on_tool_changed)
+        tool_menu.config(bg=C['border'], fg=C['text'],
+                         activebackground=C['surface'], activeforeground=C['text'],
+                         font=('Helvetica', 11), relief='flat',
+                         highlightthickness=0, bd=0)
+        tool_menu['menu'].config(bg=C['surface'], fg=C['text'],
+                                 activebackground='#C41230', activeforeground=C['text'],
+                                 font=('Helvetica', 11))
+        tool_menu.grid(row=0, column=1, padx=(0, 12))
+
+        self.tcp_offset_label = tk.Label(
+            trow, text=self._offset_str(self.tool_var.get()),
+            bg=C['surface'], fg=C['subtext'], font=('Courier', 11), anchor='w')
+        self.tcp_offset_label.grid(row=0, column=2, sticky='w', padx=(0, 12))
+
+        _btn(trow, "Apply Now", lambda: self._apply_tcp_offset(log=True),
+             C['green'], C['green_dk'], width=10).grid(row=0, column=3, padx=4)
 
         # ── Voice control ───────────────────────────────────────────────────
         s_out, s_in = _section(main, "Voice Control")
@@ -850,10 +892,42 @@ class VoiceControlApp:
 
     # --- Button callbacks --------------------------------------------------
 
+    def _offset_str(self, tool):
+        """Format a tool's TCP offset as a compact human-readable string."""
+        o = TOOL_OFFSETS[tool]
+        return (f"x={o[0]:+.0f}  y={o[1]:+.0f}  z={o[2]:+.0f}  "
+                f"roll={o[3]:+.0f}°  pitch={o[4]:+.0f}°  yaw={o[5]:+.0f}°")
+
+    def _apply_tcp_offset(self, log=True):
+        """Send the selected tool's TCP offset to the robot controller.
+
+        set_tcp_offset resets the controller state, so we re-issue set_state(0)
+        afterwards when a session is already active (mid-session tool switches).
+        During initial connect the caller issues set_state(0) after us, so we
+        skip it there (self._session_active is still False at that point).
+        """
+        tool = self.tool_var.get()
+        offset = TOOL_OFFSETS[tool]
+        if self.arm is not None:
+            code = self.arm.set_tcp_offset(offset, is_radian=False, wait=True)
+            if self._session_active:
+                self.arm.set_state(state=0)  # restore sport state after config reset
+            if log:
+                self._log(f"TCP offset applied — '{tool}': {offset}  (code={code})")
+        elif log:
+            self._log(f"[DEMO] TCP offset for '{tool}': {offset}")
+
+    def _on_tool_changed(self, tool):
+        """Called when the tool dropdown selection changes."""
+        self.tcp_offset_label.config(text=self._offset_str(tool))
+        if self._session_active:
+            self._apply_tcp_offset(log=True)
+
     def _on_demo(self):
         """Start with arm offline — gripper (if connected) is still live."""
         self.arm = None
         self._session_active = True
+        self._apply_tcp_offset()
         if self.gripper is not None:
             self._log("Gripper-only mode — gripper is live, arm commands will be simulated.")
             self.status_badge.config(text="  GRIPPER ONLY  ", bg='#8f0d22')
@@ -880,6 +954,7 @@ class VoiceControlApp:
             self.arm.connect()
             self.arm.motion_enable(enable=True)
             self.arm.set_mode(0)
+            self._apply_tcp_offset()        # set offset before enabling sport state
             self.arm.set_state(state=0)
             self._log("Connected. Motion enabled.")
             self._session_active = True
