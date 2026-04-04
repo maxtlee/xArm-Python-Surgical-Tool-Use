@@ -32,16 +32,13 @@ Dependencies:
   pip install pyaudio deepgram-sdk dynamixel-sdk
 """
 
-import asyncio
-import io
 import os
 import re
 import sys
 import queue
 import threading
 import tkinter as tk
-from tkinter import scrolledtext, font as tkfont
-import numpy as np
+from tkinter import scrolledtext
 import pyaudio
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
@@ -71,9 +68,8 @@ import yaml
 # Deepgram configuration
 # ---------------------------------------------------------------------------
 
-DEEPGRAM_API_KEY = "a5aca16e0cef871e915e3054375224fca9a746f2"  # ← replace if needed
+DEEPGRAM_API_KEY = "a5aca16e0cef871e915e3054375224fca9a746f2"
 
-# PyAudio capture settings (must match Deepgram LiveOptions)
 _DG_CHUNK    = 2048
 _DG_FORMAT   = pyaudio.paInt16
 _DG_CHANNELS = 1
@@ -96,7 +92,6 @@ _MOTOR_IDS = {
 }
 
 _TICKS_PER_REV = 4096
-
 _ADDR_TORQUE_ENABLE    = 64
 _ADDR_PROFILE_VELOCITY = 112
 _ADDR_GOAL_POSITION    = 116
@@ -106,16 +101,13 @@ _ADDR_PRESENT_POSITION = 132
 def _degrees_to_ticks(degrees):
     return int(degrees * _TICKS_PER_REV / 360)
 
-
 def _ticks_to_degrees(ticks):
     return float(ticks * 360 / _TICKS_PER_REV)
-
 
 def _load_gripper_config(path=_POSES_FILE):
     with open(path, "r") as f:
         data = yaml.safe_load(f)
     return data.get("config", {}), data.get("poses", {})
-
 
 def _pose_to_tick_list(pose_data):
     motor_degrees = pose_data.get("motor_degrees", {})
@@ -126,39 +118,29 @@ def _pose_to_tick_list(pose_data):
 
 
 class GripperController:
-    """Controls the DexHand via Dynamixel."""
-
     def __init__(self, poses_file=_POSES_FILE):
         if not _DYNAMIXEL_AVAILABLE:
             raise RuntimeError("dynamixel_sdk not installed — run: pip install dynamixel-sdk")
-
         cfg, poses = _load_gripper_config(poses_file)
-
         port     = cfg.get("port", "/dev/ttyACM0")
         baud     = int(cfg.get("baud_rate", 2_000_000))
         protocol = float(cfg.get("protocol_version", 2.0))
         prof_vel = int(cfg.get("profile_velocity", 100))
-
         self._open_ticks  = _pose_to_tick_list(poses.get("open",  {}))
         self._close_ticks = _pose_to_tick_list(poses.get("close", {}))
-
         self._ph = PortHandler(port)
         if not self._ph.openPort():
             raise RuntimeError(f"Failed to open gripper port {port}")
         if not self._ph.setBaudRate(baud):
             raise RuntimeError("Failed to set gripper baud rate")
         self._pkt = PacketHandler(protocol)
-
         for dxl_id in _MOTOR_IDS.values():
             self._pkt.write1ByteTxRx(self._ph, dxl_id, _ADDR_TORQUE_ENABLE, 1)
             self._pkt.write4ByteTxRx(self._ph, dxl_id, _ADDR_PROFILE_VELOCITY, prof_vel)
-
         self.home_offsets = self.get_all_positions()
 
     def get_position(self, dxl_id):
-        present, _, _ = self._pkt.read4ByteTxRx(
-            self._ph, dxl_id, _ADDR_PRESENT_POSITION
-        )
+        present, _, _ = self._pkt.read4ByteTxRx(self._ph, dxl_id, _ADDR_PRESENT_POSITION)
         return present - 0x100000000 if present & 0x80000000 else present
 
     def get_all_positions(self):
@@ -168,15 +150,10 @@ class GripperController:
     def _set_positions(self, tick_list):
         for _, dxl_id in sorted(_MOTOR_IDS.items(), key=lambda kv: kv[1]):
             ticks = tick_list[dxl_id]
-            self._pkt.write4ByteTxRx(
-                self._ph, dxl_id, _ADDR_GOAL_POSITION, ticks & 0xFFFFFFFF
-            )
+            self._pkt.write4ByteTxRx(self._ph, dxl_id, _ADDR_GOAL_POSITION, ticks & 0xFFFFFFFF)
 
-    def open(self):
-        self._set_positions(self._open_ticks)
-
-    def close(self):
-        self._set_positions(self._close_ticks)
+    def open(self):   self._set_positions(self._open_ticks)
+    def close(self):  self._set_positions(self._close_ticks)
 
     def disconnect(self):
         for dxl_id in _MOTOR_IDS.values():
@@ -197,12 +174,7 @@ JOINT_POSITIONS = {
     'retract': [ -87,  91,  95,   63,  -100,  89,   28],
 }
 
-STEP = {
-    'little':  5,
-    'normal': 20,
-    'more':   40,
-    'lot':    80,
-}
+STEP = {'little': 5, 'normal': 20, 'more': 40, 'lot': 80}
 
 LITTLE_WORDS = {'little', 'slightly', 'small', 'tiny', 'bit'}
 MORE_WORDS   = {'more', 'further', 'farther', 'extra'}
@@ -210,12 +182,12 @@ LOT_WORDS    = {'lot', 'much', 'way', 'far', 'big', 'large', 'huge'}
 
 DIRECTION_MAP = {
     'forward':  ( 1,  0,  0, 'Forward  +X'),
-    'backward': (-1,  0,  0, 'Backward −X'),
-    'back':     (-1,  0,  0, 'Backward −X'),
+    'backward': (-1,  0,  0, 'Backward -X'),
+    'back':     (-1,  0,  0, 'Backward -X'),
     'left':     ( 0,  1,  0, 'Left     +Y'),
-    'right':    ( 0, -1,  0, 'Right    −Y'),
+    'right':    ( 0, -1,  0, 'Right    -Y'),
     'up':       ( 0,  0,  1, 'Up       +Z'),
-    'down':     ( 0,  0, -1, 'Down     −Z'),
+    'down':     ( 0,  0, -1, 'Down     -Z'),
 }
 
 
@@ -229,53 +201,26 @@ def _read_ip_from_conf():
     except Exception:
         return ''
 
-
 def _detect_magnitude(words):
-    if words & LOT_WORDS:
-        return STEP['lot']
-    if words & MORE_WORDS:
-        return STEP['more']
-    if words & LITTLE_WORDS:
-        return STEP['little']
+    if words & LOT_WORDS:    return STEP['lot']
+    if words & MORE_WORDS:   return STEP['more']
+    if words & LITTLE_WORDS: return STEP['little']
     return STEP['normal']
-
 
 def _tokenize(text):
     return set(re.sub(r'[^\w\s]', '', text.lower()).split())
 
-
 def parse_command(text):
-    """
-    Parses natural-language commands with optional magnitude qualifiers.
-
-    Returns one of:
-      ('move', dx, dy, dz, label)
-      ('home', label)
-      ('pickup', label)
-      ('engage', label)
-      ('retract', label)
-      ('stop', label)
-      ('gripper_open', label)
-      ('gripper_close', label)
-      None
-    """
-    words = _tokenize(text)
-
-    if 'stop' in words:
-        return ('stop', 'Emergency Stop')
+    words   = _tokenize(text)
     cleaned = re.sub(r'[^\w\s]', '', text.lower())
-    if 'go home' in cleaned:
-        return ('home', 'Go Home')
-    if 'pickup' in words or 'pick up' in cleaned:
-        return ('pickup', 'Go to Pickup')
-    if 'engage' in words:
-        return ('engage', 'Go to Engage')
-    if 'retract' in words:
-        return ('retract', 'Go to Retract')
-    if 'open' in words:
-        return ('gripper_open', 'Open Gripper')
-    if 'close' in words:
-        return ('gripper_close', 'Close Gripper')
+
+    if 'stop'    in words:                         return ('stop',          'Emergency Stop')
+    if 'go home' in cleaned:                        return ('home',          'Go Home')
+    if 'pickup'  in words or 'pick up' in cleaned:  return ('pickup',        'Go to Pickup')
+    if 'engage'  in words:                          return ('engage',         'Go to Engage')
+    if 'retract' in words:                          return ('retract',        'Go to Retract')
+    if 'open'    in words:                          return ('gripper_open',  'Open Gripper')
+    if 'close'   in words:                          return ('gripper_close', 'Close Gripper')
 
     for keyword, (ux, uy, uz, base_label) in DIRECTION_MAP.items():
         if keyword in words:
@@ -289,46 +234,25 @@ def parse_command(text):
 
     return None
 
-
 def _cmd_label(cmd):
     return cmd[-1] if cmd else '—'
 
 
 # ---------------------------------------------------------------------------
-# Deepgram listen loop  (replaces the old Whisper listen_loop)
+# listen_loop — stopped by listen_stop only
 # ---------------------------------------------------------------------------
 
-def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
+def listen_loop(cmd_queue, listen_stop, on_mic_state, on_heard):
     """
-    Captures microphone audio and streams it to Deepgram's WebSocket API for
-    real-time transcription.  Final transcripts are parsed as commands and
-    put onto cmd_queue.  Interim results are shown in the UI but not acted on.
-
-    This function blocks until stop_event is set.  It is designed to run in
-    a daemon thread identically to the original Whisper-based listen_loop so
-    that no other part of the application needs to change.
-
-    Key differences from the original:
-      • No local model to load — transcription is handled server-side.
-      • Interim results are surfaced to on_heard immediately so the user can
-        see live partial text even before a final result is confirmed.
-      • Only *final* Deepgram results trigger parse_command / cmd_queue.put.
-
-    Deepgram LiveOptions used:
-      model          = nova-2        (best accuracy / latency balance)
-      language       = en-US
-      smart_format   = True          (punctuation, numbers, etc.)
-      interim_results= True          (stream partials to UI)
-      encoding       = linear16      (raw PCM — matches PyAudio paInt16)
-      sample_rate    = 16000
+    Streams mic audio to Deepgram until listen_stop is set.
+    Final transcripts are parsed and put on cmd_queue.
+    Interim transcripts update the UI only (prefixed '[live]').
     """
     if not _DEEPGRAM_AVAILABLE:
         on_mic_state("ERROR: run  pip install deepgram-sdk")
         return
 
-    # --- Deepgram connection -------------------------------------------
-    on_mic_state("Connecting to Deepgram…")
-
+    on_mic_state("Connecting to Deepgram...")
     try:
         client        = DeepgramClient(DEEPGRAM_API_KEY)
         dg_connection = client.listen.websocket.v("1")
@@ -336,28 +260,22 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
         on_mic_state(f"Deepgram init error: {e}")
         return
 
-    # Shared state for the async transcript callback
     _last_interim = {"text": ""}
 
     def on_transcript(self_dg, result, **kwargs):
-        """Called by Deepgram for every transcript event (interim + final)."""
         try:
             transcript = result.channel.alternatives[0].transcript
         except (AttributeError, IndexError):
             return
-
         if not transcript:
             return
-
         if result.is_final:
-            # Final — parse and (possibly) enqueue a command
             cmd = parse_command(transcript)
             on_heard(transcript, cmd)
             if cmd is not None:
                 cmd_queue.put(cmd)
             _last_interim["text"] = ""
         else:
-            # Interim — update UI only, do not enqueue
             if transcript != _last_interim["text"]:
                 _last_interim["text"] = transcript
                 on_heard(f"[live] {transcript}", None)
@@ -377,16 +295,11 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
         on_mic_state("ERROR: Deepgram connection failed")
         return
 
-    # --- PyAudio capture --------------------------------------------------
-    audio  = pyaudio.PyAudio()
-    stream = None
-
+    audio = pyaudio.PyAudio()
     try:
         stream = audio.open(
-            format=_DG_FORMAT,
-            channels=_DG_CHANNELS,
-            rate=_DG_RATE,
-            input=True,
+            format=_DG_FORMAT, channels=_DG_CHANNELS,
+            rate=_DG_RATE, input=True,
             frames_per_buffer=_DG_CHUNK,
         )
     except Exception as e:
@@ -395,10 +308,9 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
         audio.terminate()
         return
 
-    on_mic_state("● Listening…")
-
+    on_mic_state("● Listening...")
     try:
-        while not stop_event.is_set():
+        while not listen_stop.is_set():
             try:
                 data = stream.read(_DG_CHUNK, exception_on_overflow=False)
                 dg_connection.send(data)
@@ -409,7 +321,6 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
         stream.stop_stream()
         stream.close()
         audio.terminate()
-        # Gracefully close the Deepgram WebSocket
         try:
             dg_connection.finish()
         except Exception:
@@ -418,16 +329,18 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
 
 
 # ---------------------------------------------------------------------------
-# Execute loop  (unchanged from original)
+# execute_loop — stopped by exec_stop only (NOT by listen_stop)
 # ---------------------------------------------------------------------------
 
-def execute_loop(arm, gripper, cmd_queue, stop_event, on_active, on_done, on_log):
+def execute_loop(arm, gripper, cmd_queue, exec_stop, on_active, on_done, on_log):
     """
-    Drains cmd_queue and executes each command on the arm or gripper.
-    If arm is None (demo mode), arm commands are logged but not sent.
-    Gripper commands are always executed if gripper is not None.
+    Drains cmd_queue until exec_stop is set.
+
+    exec_stop is set ONLY on Disconnect / window close.
+    'Stop Listening' does NOT set it — so the executor stays alive across
+    every stop/start mic cycle and will always process queued commands.
     """
-    while not stop_event.is_set():
+    while not exec_stop.is_set():
         try:
             cmd = cmd_queue.get(timeout=0.5)
         except queue.Empty:
@@ -445,10 +358,8 @@ def execute_loop(arm, gripper, cmd_queue, stop_event, on_active, on_done, on_log
             else:
                 on_log(f"Executing: {label}")
                 try:
-                    if cmd[0] == 'gripper_open':
-                        gripper.open()
-                    elif cmd[0] == 'gripper_close':
-                        gripper.close()
+                    if cmd[0] == 'gripper_open':  gripper.open()
+                    else:                          gripper.close()
                 except Exception as e:
                     on_log(f"Gripper error during '{label}': {e}")
         elif arm is None:
@@ -460,19 +371,12 @@ def execute_loop(arm, gripper, cmd_queue, stop_event, on_active, on_done, on_log
                 if cmd[0] == 'stop':
                     arm.emergency_stop()
                 elif cmd[0] in ('home', 'pickup', 'engage', 'retract'):
-                    arm.set_servo_angle(
-                        angle=JOINT_POSITIONS[cmd[0]],
-                        speed=30, wait=True,
-                    )
+                    arm.set_servo_angle(angle=JOINT_POSITIONS[cmd[0]], speed=30, wait=True)
                 elif cmd[0] == 'move':
                     _, dx, dy, dz, _ = cmd
-                    arm.set_position(
-                        x=dx, y=dy, z=dz,
-                        roll=0, pitch=0, yaw=0,
-                        relative=True,
-                        speed=SPEED,
-                        wait=True,
-                    )
+                    arm.set_position(x=dx, y=dy, z=dz,
+                                     roll=0, pitch=0, yaw=0,
+                                     relative=True, speed=SPEED, wait=True)
             except Exception as e:
                 on_log(f"Arm error during '{label}': {e}")
 
@@ -535,8 +439,19 @@ def _section(parent, title):
 
 class VoiceControlApp:
     """
-    Tkinter GUI that connects to an xArm, streams audio to Deepgram for
-    real-time transcription, and executes Cartesian movements in real time.
+    Threading model
+    ---------------
+    listen_stop  — set by 'Stop Listening', cleared by 'Start Listening'.
+                   Only listen_loop watches this event.
+
+    exec_stop    — set ONLY by Disconnect / window close.
+                   execute_loop watches this event.
+                   It is NEVER touched by Stop/Start Listening, so the
+                   executor survives across mic cycles and always drains
+                   the queue.
+
+    The executor is spawned once when the session starts (Connect / Demo)
+    and lives until the session ends (Disconnect / close).
     """
 
     def __init__(self, root):
@@ -546,13 +461,16 @@ class VoiceControlApp:
         self.root.configure(bg=C['bg'])
         self.root.minsize(700, 700)
 
-        self.arm = None
+        self.arm     = None
         self.gripper = None
         self._session_active = False
-        self.stop_event = threading.Event()
+
+        self.listen_stop = threading.Event()  # mic only
+        self.exec_stop   = threading.Event()  # executor (session end)
+
         self.voice_thread = None
-        self.exec_thread = None
-        self.cmd_queue = queue.Queue()
+        self.exec_thread  = None
+        self.cmd_queue    = queue.Queue()
 
         try:
             self.gripper = GripperController()
@@ -564,59 +482,69 @@ class VoiceControlApp:
 
         self._build_ui()
 
-    # --- UI construction ---------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Session helpers
+    # -----------------------------------------------------------------------
+
+    def _start_executor(self):
+        """Spawn the executor thread once per session."""
+        if self.exec_thread and self.exec_thread.is_alive():
+            return
+        self.exec_stop.clear()
+        self.exec_thread = threading.Thread(
+            target=execute_loop,
+            args=(self.arm, self.gripper, self.cmd_queue, self.exec_stop,
+                  self._set_active, self._on_cmd_done, self._log),
+            daemon=True,
+        )
+        self.exec_thread.start()
+
+    def _stop_executor(self):
+        """Kill the executor (disconnect / close only)."""
+        self.exec_stop.set()
+
+    # -----------------------------------------------------------------------
+    # UI construction
+    # -----------------------------------------------------------------------
 
     def _build_ui(self):
         W = self.root
         P = {'padx': 16}
 
-        # ── Menubar ─────────────────────────────────────────────────────────
-        menubar = tk.Menu(W, bg=C['surface'], fg=C['text'],
-                          activebackground='#C41230', activeforeground=C['text'],
-                          relief='flat', bd=0)
+        # Menubar
+        menubar  = tk.Menu(W, bg=C['surface'], fg=C['text'],
+                           activebackground='#C41230', activeforeground=C['text'],
+                           relief='flat', bd=0)
         cmd_menu = tk.Menu(menubar, tearoff=0,
                            bg=C['surface'], fg=C['text'],
                            activebackground='#C41230', activeforeground=C['text'],
                            relief='flat', bd=0, font=('Courier', 12))
         cmd_menu.add_command(
-            label='Qualifiers:  (none) = 20 mm  |  a little = 5 mm  |  more = 40 mm  |  a lot = 80 mm',
+            label='Qualifiers:  (none)=20mm  a little=5mm  more=40mm  a lot=80mm',
             state='disabled')
         cmd_menu.add_separator()
         for line in [
-            '"forward [qualifier]"   →  +X',
-            '"backward [qualifier]"  →  -X',
-            '"left [qualifier]"      →  +Y',
-            '"right [qualifier]"     →  -Y',
-            '"up [qualifier]"        →  +Z',
-            '"down [qualifier]"      →  -Z',
+            '"forward [qualifier]"  -> +X', '"backward [qualifier]" -> -X',
+            '"left [qualifier]"     -> +Y', '"right [qualifier]"    -> -Y',
+            '"up [qualifier]"       -> +Z', '"down [qualifier]"     -> -Z',
         ]:
             cmd_menu.add_command(label=line, state='disabled')
         cmd_menu.add_separator()
-        for line in [
-            '"go home"               →  return to home position',
-            '"pickup"                →  move to pickup position',
-            '"engage"                →  move to engage position',
-            '"retract"               →  move to retract position',
-            '"stop"                  →  emergency stop',
-        ]:
+        for line in ['"go home" -> home', '"pickup" -> pickup', '"engage" -> engage',
+                     '"retract" -> retract', '"stop" -> emergency stop',
+                     '"open" -> open gripper', '"close" -> close gripper']:
             cmd_menu.add_command(label=line, state='disabled')
-        cmd_menu.add_separator()
-        cmd_menu.add_command(label='"open"   →  open DexHand gripper',  state='disabled')
-        cmd_menu.add_command(label='"close"  →  close DexHand gripper', state='disabled')
         menubar.add_cascade(label='Commands', menu=cmd_menu)
         W.config(menu=menubar)
 
-        # ── Header ──────────────────────────────────────────────────────────
+        # Header
         hdr = tk.Frame(W, bg='#C41230', pady=16)
         hdr.pack(fill='x')
         tk.Label(hdr, text="xArm  Voice Control", bg='#C41230', fg='#ffffff',
                  font=('Helvetica', 22, 'bold')).pack(side='left', padx=20)
-
-        # Deepgram badge
         tk.Label(hdr, text="  Deepgram  ", bg='#101010', fg='#13ef95',
                  font=('Helvetica', 9, 'bold'), padx=6, pady=3).pack(
                      side='left', padx=(0, 12), pady=8)
-
         self.status_badge = tk.Label(hdr, text="  OFFLINE  ", bg='#8f0d22', fg='#ffffff',
                                      font=('Helvetica', 10, 'bold'), padx=8, pady=4)
         self.status_badge.pack(side='right', padx=20, pady=6)
@@ -624,55 +552,43 @@ class VoiceControlApp:
         main = tk.Frame(W, bg=C['bg'])
         main.pack(fill='both', expand=True, padx=16, pady=8)
 
-        # ── Connection ──────────────────────────────────────────────────────
+        # Connection
         s_out, s_in = _section(main, "Connection")
         s_out.pack(fill='x', pady=0, **P)
-
         row = tk.Frame(s_in, bg=C['surface'])
         row.pack(fill='x', padx=12, pady=12)
-
         tk.Label(row, text="Robot IP", bg=C['surface'], fg=C['subtext'],
                  font=('Helvetica', 11)).grid(row=0, column=0, sticky='w', padx=(0, 8))
-
         self.ip_var = tk.StringVar(value=_read_ip_from_conf())
-        ip_entry = tk.Entry(row, textvariable=self.ip_var, width=18,
-                            bg=C['border'], fg=C['text'], insertbackground=C['text'],
-                            relief='flat', font=('Helvetica', 12), bd=0)
-        ip_entry.grid(row=0, column=1, ipady=6, padx=(0, 12))
-
-        self.btn_connect = _btn(row, "Connect", self._on_connect, C['green'], C['green_dk'])
+        tk.Entry(row, textvariable=self.ip_var, width=18,
+                 bg=C['border'], fg=C['text'], insertbackground=C['text'],
+                 relief='flat', font=('Helvetica', 12), bd=0).grid(
+                     row=0, column=1, ipady=6, padx=(0, 12))
+        self.btn_connect    = _btn(row, "Connect",    self._on_connect,    C['green'],  C['green_dk'])
+        self.btn_demo       = _btn(row, "Demo Mode",  self._on_demo,       C['orange'], C['orange_dk'])
+        self.btn_disconnect = _btn(row, "Disconnect", self._on_disconnect, C['grey'],   C['grey_dk'], state='disabled')
         self.btn_connect.grid(row=0, column=2, padx=4)
-
-        self.btn_demo = _btn(row, "Demo Mode", self._on_demo, C['orange'], C['orange_dk'])
         self.btn_demo.grid(row=0, column=3, padx=4)
-
-        self.btn_disconnect = _btn(row, "Disconnect", self._on_disconnect,
-                                   C['grey'], C['grey_dk'], state='disabled')
         self.btn_disconnect.grid(row=0, column=4, padx=4)
 
-        # ── Voice control ───────────────────────────────────────────────────
+        # Voice control
         s_out, s_in = _section(main, "Voice Control  (Deepgram streaming)")
         s_out.pack(fill='x', pady=(4, 0), **P)
-
         vrow = tk.Frame(s_in, bg=C['surface'])
         vrow.pack(fill='x', padx=12, pady=12)
-
-        self.btn_start = _btn(vrow, "Start Listening", self._on_start,
-                              C['blue'], C['blue_dk'], state='disabled', width=18)
-        self.btn_start.pack(side='left', padx=(0, 8))
-
-        self.btn_stop_listen = _btn(vrow, "Stop Listening", self._on_stop_listening,
+        self.btn_start       = _btn(vrow, "Start Listening", self._on_start,
+                                    C['blue'], C['blue_dk'], state='disabled', width=18)
+        self.btn_stop_listen = _btn(vrow, "Stop Listening",  self._on_stop_listening,
                                     C['grey'], C['grey_dk'], state='disabled', width=18)
+        self.btn_estop       = _btn(vrow, "EMERGENCY STOP",  self._on_estop,
+                                    C['red'],  C['red_dk'],  state='disabled', width=18, big=True)
+        self.btn_start.pack(side='left', padx=(0, 8))
         self.btn_stop_listen.pack(side='left', padx=(0, 16))
-
-        self.btn_estop = _btn(vrow, "EMERGENCY STOP", self._on_estop,
-                              C['red'], C['red_dk'], state='disabled', width=18, big=True)
         self.btn_estop.pack(side='right')
 
-        # ── Live Status ─────────────────────────────────────────────────────
+        # Live Status
         s_out, s_in = _section(main, "Live Status")
         s_out.pack(fill='x', pady=(4, 0), **P)
-
         grid = tk.Frame(s_in, bg=C['surface'])
         grid.pack(fill='x', padx=12, pady=12)
         grid.columnconfigure(1, weight=1)
@@ -680,7 +596,7 @@ class VoiceControlApp:
         def _stat_row(r, label):
             tk.Label(grid, text=label, bg=C['surface'], fg=C['subtext'],
                      font=('Helvetica', 11, 'bold'), width=7, anchor='w').grid(
-                row=r, column=0, sticky='w', pady=3)
+                         row=r, column=0, sticky='w', pady=3)
 
         _stat_row(0, "Mic")
         self.mic_var = tk.StringVar(value="—")
@@ -688,24 +604,23 @@ class VoiceControlApp:
                  font=('Helvetica', 12), anchor='w').grid(row=0, column=1, sticky='w', padx=8)
 
         _stat_row(1, "Heard")
-        self.heard_var = tk.StringVar(value="—")
+        self.heard_var   = tk.StringVar(value="—")
         self.heard_label = tk.Label(grid, textvariable=self.heard_var,
                                     bg=C['surface'], fg=C['text'],
                                     font=('Helvetica', 12), anchor='w')
         self.heard_label.grid(row=1, column=1, sticky='w', padx=8)
 
         _stat_row(2, "Active")
-        self.active_var = tk.StringVar(value="—")
+        self.active_var   = tk.StringVar(value="—")
         self.active_label = tk.Label(grid, textvariable=self.active_var,
                                      bg=C['grey'], fg=C['text'],
                                      font=('Helvetica', 14, 'bold'),
                                      anchor='w', padx=12, pady=6, width=28)
         self.active_label.grid(row=2, column=1, sticky='w', padx=8, pady=(4, 0))
 
-        # ── Bottom: queue + log ─────────────────────────────────────────────
+        # Activity
         bot_out, bot_in = _section(main, "Activity")
         bot_out.pack(fill='both', expand=True, pady=(4, 8), **P)
-
         bot_in.columnconfigure(0, weight=1)
         bot_in.columnconfigure(1, weight=3)
         bot_in.rowconfigure(0, weight=1)
@@ -714,44 +629,39 @@ class VoiceControlApp:
         q_wrap.grid(row=0, column=0, sticky='nsew', padx=(12, 4), pady=12)
         tk.Label(q_wrap, text="Queue", bg=C['surface'], fg=C['subtext'],
                  font=('Helvetica', 10, 'bold')).pack(anchor='w', pady=(0, 4))
-
         self.queue_listbox = tk.Listbox(
             q_wrap, bg=C['bg'], fg=C['text'], selectbackground=C['blue'],
             font=('Courier', 12), relief='flat', bd=0,
-            highlightthickness=0, activestyle='none',
-        )
+            highlightthickness=0, activestyle='none')
         self.queue_listbox.pack(fill='both', expand=True)
 
         log_wrap = tk.Frame(bot_in, bg=C['surface'])
         log_wrap.grid(row=0, column=1, sticky='nsew', padx=(4, 12), pady=12)
         tk.Label(log_wrap, text="History", bg=C['surface'], fg=C['subtext'],
                  font=('Helvetica', 10, 'bold')).pack(anchor='w', pady=(0, 4))
-
         self.status_log = scrolledtext.ScrolledText(
             log_wrap, bg=C['bg'], fg=C['text'], insertbackground=C['text'],
             font=('Courier', 12), relief='flat', bd=0,
-            highlightthickness=0, state='disabled', wrap='word',
-        )
+            highlightthickness=0, state='disabled', wrap='word')
         self.status_log.pack(fill='both', expand=True)
 
-        # ── Reference card ──────────────────────────────────────────────────
+        # Reference card
         ref_out, ref_in = _section(main, "Voice Commands")
         ref_out.pack(fill='x', pady=(0, 16), **P)
-
         commands = [
-            ('forward [qualifier]',  '±X  (5 / 20 / 40 / 80 mm)'),
-            ('backward [qualifier]', '±X  (5 / 20 / 40 / 80 mm)'),
-            ('left [qualifier]',     '±Y  (5 / 20 / 40 / 80 mm)'),
-            ('right [qualifier]',    '±Y  (5 / 20 / 40 / 80 mm)'),
-            ('up [qualifier]',       '±Z  (5 / 20 / 40 / 80 mm)'),
-            ('down [qualifier]',     '±Z  (5 / 20 / 40 / 80 mm)'),
-            ('go home',              'move to home position'),
-            ('pickup',               'move to pickup position'),
-            ('engage',               'move to engage position'),
-            ('retract',              'move to retract position'),
-            ('stop',                 'emergency stop'),
-            ('open',                 'open DexHand gripper'),
-            ('close',                'close DexHand gripper'),
+            ('forward [qualifier]',  '+-X  (5/20/40/80 mm)'),
+            ('backward [qualifier]', '+-X  (5/20/40/80 mm)'),
+            ('left [qualifier]',     '+-Y  (5/20/40/80 mm)'),
+            ('right [qualifier]',    '+-Y  (5/20/40/80 mm)'),
+            ('up [qualifier]',       '+-Z  (5/20/40/80 mm)'),
+            ('down [qualifier]',     '+-Z  (5/20/40/80 mm)'),
+            ('go home',   'move to home position'),
+            ('pickup',    'move to pickup position'),
+            ('engage',    'move to engage position'),
+            ('retract',   'move to retract position'),
+            ('stop',      'emergency stop'),
+            ('open',      'open DexHand gripper'),
+            ('close',     'close DexHand gripper'),
         ]
         ref_grid = tk.Frame(ref_in, bg=C['surface'])
         ref_grid.pack(fill='x', padx=12, pady=10)
@@ -766,33 +676,29 @@ class VoiceControlApp:
                          row=i, column=1, sticky='w', pady=2)
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(100, lambda: (
+            self._log("Gripper connected.")
+            if self.gripper is not None
+            else self._log(f"Gripper not connected: {self._gripper_init_error}")
+        ))
 
-        self.root.after(
-            100,
-            lambda: (
-                self._log("Gripper connected.")
-                if self.gripper is not None
-                else self._log(f"Gripper not connected: {self._gripper_init_error}")
-            ),
-        )
-
-    # --- Thread-safe GUI updates -------------------------------------------
+    # -----------------------------------------------------------------------
+    # Thread-safe GUI updates
+    # -----------------------------------------------------------------------
 
     def _set_mic_state(self, text):
         self.root.after(0, lambda: self.mic_var.set(text))
 
     def _set_heard(self, raw_text, cmd):
         def _update():
-            is_interim = raw_text.startswith("[live]")
-            if is_interim:
-                # Show interim transcript in a muted colour without logging
+            if raw_text.startswith("[live]"):
                 self.heard_var.set(raw_text)
-                self.heard_label.config(fg='#6b7280')  # grey for partials
+                self.heard_label.config(fg='#6b7280')
             elif cmd is None:
-                self.heard_var.set(f'"{raw_text}"   ✗ unrecognised')
+                self.heard_var.set(f'"{raw_text}"   x unrecognised')
                 self.heard_label.config(fg='#f87171')
             else:
-                self.heard_var.set(f'"{raw_text}"   → {_cmd_label(cmd)}')
+                self.heard_var.set(f'"{raw_text}"   -> {_cmd_label(cmd)}')
                 self.heard_label.config(fg=C['green'])
         self.root.after(0, _update)
 
@@ -818,9 +724,7 @@ class VoiceControlApp:
         self.root.after(0, _update)
 
     def _enqueue_display(self, cmd):
-        def _update():
-            self.queue_listbox.insert('end', _cmd_label(cmd))
-        self.root.after(0, _update)
+        self.root.after(0, lambda: self.queue_listbox.insert('end', _cmd_label(cmd)))
 
     def _log(self, msg):
         def _append():
@@ -830,48 +734,46 @@ class VoiceControlApp:
             self.status_log.config(state='disabled')
         self.root.after(0, _append)
 
-    # --- on_heard callback (called from listen thread) ---------------------
+    # -----------------------------------------------------------------------
+    # on_heard callback
+    # -----------------------------------------------------------------------
 
     def _on_heard(self, raw_text, cmd):
-        """
-        Callback from listen_loop.  Interim results (prefixed "[live]") are
-        shown in the Heard label but are NOT logged to History to avoid noise.
-        Only final transcripts are logged and queued.
-        """
         self._set_heard(raw_text, cmd)
-
         if raw_text.startswith("[live]"):
-            return  # don't log or enqueue interim results
-
+            return
         if cmd is not None:
             self._log(f'Queued: {_cmd_label(cmd)}  ("{raw_text}")')
             self._enqueue_display(cmd)
         else:
             self._log(f'Unrecognised: "{raw_text}"')
 
-    # --- Button callbacks --------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Button callbacks
+    # -----------------------------------------------------------------------
 
     def _on_demo(self):
         self.arm = None
         self._session_active = True
         if self.gripper is not None:
-            self._log("Gripper-only mode — gripper is live, arm commands will be simulated.")
+            self._log("Gripper-only mode — arm commands will be simulated.")
             self.status_badge.config(text="  GRIPPER ONLY  ", bg='#8f0d22')
         else:
-            self._log("Demo mode — commands will be simulated, no robot connected.")
+            self._log("Demo mode — all commands will be simulated.")
             self.status_badge.config(text="  DEMO  ", bg='#5a5a5a')
         self.btn_connect.config(state='disabled')
         self.btn_demo.config(state='disabled')
         self.btn_disconnect.config(state='normal', bg=C['grey'])
         self.btn_start.config(state='normal', bg=C['blue'])
         self.btn_estop.config(state='normal', bg=C['red'])
+        self._start_executor()
 
     def _on_connect(self):
         ip = self.ip_var.get().strip()
         if not ip:
             self._log("ERROR: Enter a robot IP address.")
             return
-        self._log(f"Connecting to {ip}…")
+        self._log(f"Connecting to {ip}...")
         try:
             self.arm = XArmAPI(ip, do_not_open=True)
             self.arm.register_error_warn_changed_callback(self._on_arm_error)
@@ -885,7 +787,7 @@ class VoiceControlApp:
             self._log(f"Connection failed: {e}")
             self.arm = None
             if self.gripper is not None:
-                self._log("Arm unavailable — falling back to gripper-only mode.")
+                self._log("Falling back to gripper-only mode.")
                 self._on_demo()
             return
 
@@ -893,59 +795,45 @@ class VoiceControlApp:
         self.btn_disconnect.config(state='normal', bg=C['grey'])
         self.btn_start.config(state='normal', bg=C['blue'])
         self.btn_estop.config(state='normal', bg=C['red'])
-        if self.gripper is not None:
-            self.status_badge.config(text="  LIVE  ", bg='#8f0d22')
-        else:
-            self.status_badge.config(text="  ARM ONLY  ", bg='#8f0d22')
+        self.status_badge.config(
+            text="  LIVE  " if self.gripper else "  ARM ONLY  ", bg='#8f0d22')
+        self._start_executor()
 
     def _on_disconnect(self):
-        self._on_stop_listening()
+        self._on_stop_listening()   # stop mic thread
+        self._stop_executor()       # stop executor thread
         if self.arm:
             self.arm.disconnect()
             self.arm = None
         self._session_active = False
         self._log("Disconnected.")
         self.status_badge.config(text="  OFFLINE  ", bg='#2e2e2e')
-        self.btn_connect.config(state='normal', bg=C['green'])
-        self.btn_demo.config(state='normal', bg=C['orange'])
+        self.btn_connect.config(state='normal',      bg=C['green'])
+        self.btn_demo.config(state='normal',         bg=C['orange'])
         self.btn_disconnect.config(state='disabled', bg=C['grey_dk'])
-        self.btn_start.config(state='disabled', bg=C['blue_dk'])
-        self.btn_stop_listen.config(state='disabled', bg=C['grey_dk'])
-        self.btn_estop.config(state='disabled', bg=C['red_dk'])
+        self.btn_start.config(state='disabled',      bg=C['blue_dk'])
+        self.btn_stop_listen.config(state='disabled',bg=C['grey_dk'])
+        self.btn_estop.config(state='disabled',      bg=C['red_dk'])
 
     def _on_start(self):
         if self.voice_thread and self.voice_thread.is_alive():
             return
-        self.queue_listbox.delete(0, 'end')
-        while not self.cmd_queue.empty():
-            try:
-                self.cmd_queue.get_nowait()
-            except queue.Empty:
-                break
-
-        self.stop_event.clear()
-
+        self.listen_stop.clear()  # arm the mic event for this session
         self.voice_thread = threading.Thread(
             target=listen_loop,
-            args=(self.cmd_queue, self.stop_event,
+            args=(self.cmd_queue, self.listen_stop,
                   self._set_mic_state, self._on_heard),
             daemon=True,
         )
-        self.exec_thread = threading.Thread(
-            target=execute_loop,
-            args=(self.arm, self.gripper, self.cmd_queue, self.stop_event,
-                  self._set_active, self._on_cmd_done, self._log),
-            daemon=True,
-        )
         self.voice_thread.start()
-        self.exec_thread.start()
-
         self.btn_start.config(state='disabled')
         self.btn_stop_listen.config(state='normal')
         self._log("Voice listener started (Deepgram streaming).")
 
     def _on_stop_listening(self):
-        self.stop_event.set()
+        # Sets listen_stop → kills mic thread only.
+        # exec_stop is untouched → executor keeps running.
+        self.listen_stop.set()
         self.btn_start.config(state='normal' if self._session_active else 'disabled')
         self.btn_stop_listen.config(state='disabled')
         self._set_mic_state("Stopped")
@@ -966,7 +854,7 @@ class VoiceControlApp:
                 break
 
     def _on_arm_error(self, item):
-        self._log(f"Arm error/warn — code={item.get('error_code')} warn={item.get('warn_code')}")
+        self._log(f"Arm error — code={item.get('error_code')} warn={item.get('warn_code')}")
 
     def _on_close(self):
         self._on_disconnect()
