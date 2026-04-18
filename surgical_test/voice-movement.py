@@ -285,19 +285,46 @@ ROTATION_MAP = {
 # Preset-position state machine
 # ---------------------------------------------------------------------------
 #
-# Sparse directed graph of allowed transitions into each preset position,
-# expressed as {target: {allowed source states}}. A transition is legal when
-# the current state is in the target's source set. Override by proximity is
-# permitted when Cartesian TCP distance to the target is within
-# POSITION_RADII[target] mm AND every joint is within JOINT_TOLERANCE° of the
-# target joint angles. Manual Cartesian moves/rotations clear the state.
+# Sparse directed graph of allowed transitions into each preset position.
+# Edges are (source_state, joint_speed_deg_per_s): each entry under a target
+# key lists the legal source states from which we may enter that target and
+# the joint-space speed (°/s, passed to set_servo_angle) used for that move.
+# Every edge can carry a distinct speed; tune per-motion safety as needed.
+#
+# A transition is legal when the current state matches one of the target's
+# source states. Override by proximity is permitted when Cartesian TCP
+# distance to the target is within POSITION_RADII[target] mm AND every joint
+# is within JOINT_TOLERANCE° of the target joint angles. Manual Cartesian
+# moves/rotations clear the state.
 
 STATE_TRANSITIONS = {
-    'home':    {'extend'},
-    'extend':  {'engage', 'home'},
-    'engage':  {'extend', 'retract'},
-    'retract': {'engage'},
+    'home':    {('extend',  40)},
+    'extend':  {('engage',  10), ('home',    40)},
+    'engage':  {('extend',  10), ('retract', 10)},
+    'retract': {('engage',  10)},
 }
+
+
+def _allowed_sources(target):
+    """Return the set of source-state names that may enter `target`."""
+    return {src for src, _ in STATE_TRANSITIONS.get(target, set())}
+
+
+def _transition_speed(target, source):
+    """Joint-speed (°/s) for source→target, or None if the edge is absent."""
+    for src, speed in STATE_TRANSITIONS.get(target, set()):
+        if src == source:
+            return speed
+    return None
+
+
+def _override_speed(target):
+    """Fallback speed for a proximity-override entry into `target`.
+
+    Uses the slowest incoming edge speed — overrides happen from unknown
+    source states, so we default to the safest legal approach."""
+    speeds = [s for _, s in STATE_TRANSITIONS.get(target, set())]
+    return min(speeds) if speeds else 20
 
 # Cartesian radius (mm) within which override is permitted per target preset.
 POSITION_RADII = {
@@ -627,8 +654,8 @@ def execute_loop(arm, gripper, cmd_queue, stop_event,
             elif kind in ('home', 'extend', 'engage', 'retract'):
                 target = kind
                 current = get_state()
-                allowed_sources = STATE_TRANSITIONS.get(target, set())
-                legal = current in allowed_sources
+                speed = _transition_speed(target, current)
+                legal = speed is not None
                 override = False if legal else _can_override_transition(arm, target)
 
                 if not legal and not override:
@@ -637,16 +664,18 @@ def execute_loop(arm, gripper, cmd_queue, stop_event,
                     on_illegal(target, current)
                 else:
                     if override:
+                        speed = _override_speed(target)
                         on_log(f"Override allowed for '{target}' "
-                               f"(within radius + joint tolerance).")
+                               f"(within radius + joint tolerance). "
+                               f"Using fallback speed {speed}°/s.")
                     if arm is None:
-                        on_log(f"[DEMO] Would execute: {label}")
+                        on_log(f"[DEMO] Would execute: {label} @ {speed}°/s")
                         import time; time.sleep(0.4)
                     else:
-                        on_log(f"Executing: {label}")
+                        on_log(f"Executing: {label} @ {speed}°/s")
                         arm.set_servo_angle(
                             angle=JOINT_POSITIONS[target],
-                            speed=30, wait=True,
+                            speed=speed, wait=True,
                         )
                     set_state(target)
 
@@ -1278,7 +1307,7 @@ class VoiceControlApp:
     def _on_illegal_transition(self, target, current):
         """Called from the executor thread when a preset transition is blocked.
         Schedules a modal warning popup on the main thread."""
-        allowed = sorted(STATE_TRANSITIONS.get(target, set())) or ['(none)']
+        allowed = sorted(_allowed_sources(target)) or ['(none)']
         radius = POSITION_RADII.get(target, 0.0)
         msg = (
             f"Cannot move to '{target}' from '{current or 'unknown'}'.\n\n"
