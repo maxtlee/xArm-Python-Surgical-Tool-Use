@@ -51,7 +51,7 @@ import sys
 import queue
 import threading
 import tkinter as tk
-from tkinter import scrolledtext, font as tkfont
+from tkinter import scrolledtext, font as tkfont, messagebox
 import numpy as np
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
@@ -281,6 +281,69 @@ ROTATION_MAP = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Preset-position state machine
+# ---------------------------------------------------------------------------
+#
+# Sparse directed graph of allowed transitions into each preset position,
+# expressed as {target: {allowed source states}}. A transition is legal when
+# the current state is in the target's source set. Override by proximity is
+# permitted when Cartesian TCP distance to the target is within
+# POSITION_RADII[target] mm AND every joint is within JOINT_TOLERANCE° of the
+# target joint angles. Manual Cartesian moves/rotations clear the state.
+
+STATE_TRANSITIONS = {
+    'home':    {'extend'},
+    'extend':  {'engage', 'home'},
+    'engage':  {'extend', 'retract'},
+    'retract': {'engage'},
+}
+
+# Cartesian radius (mm) within which override is permitted per target preset.
+POSITION_RADII = {
+    'home':    500.0,
+    'extend':   50.0,
+    'engage':   50.0,
+    'retract':  50.0,
+}
+
+# Per-joint tolerance (degrees) required for override in addition to radius.
+JOINT_TOLERANCE = 45.0
+
+
+def _can_override_transition(arm, target):
+    """True if the arm's current pose is close enough to `target` to override
+    the state-machine check.
+
+    Returns False on any read error or if the arm is too far in joint space or
+    Cartesian space. Uses forward kinematics on the target joint angles so we
+    don't need to pre-compute Cartesian target poses.
+    """
+    if arm is None or target not in JOINT_POSITIONS:
+        return False
+    target_joints = JOINT_POSITIONS[target]
+
+    code, current_joints = arm.get_servo_angle()
+    if code != 0 or current_joints is None:
+        return False
+    for c, t in zip(current_joints, target_joints):
+        if abs(c - t) > JOINT_TOLERANCE:
+            return False
+
+    code, current_pose = arm.get_position()
+    if code != 0 or current_pose is None:
+        return False
+    code, target_pose = arm.get_forward_kinematics(
+        target_joints, input_is_radian=False, return_is_radian=False)
+    if code != 0 or target_pose is None:
+        return False
+
+    dx = current_pose[0] - target_pose[0]
+    dy = current_pose[1] - target_pose[1]
+    dz = current_pose[2] - target_pose[2]
+    return (dx * dx + dy * dy + dz * dz) ** 0.5 <= POSITION_RADII.get(target, 0.0)
+
+
 def _read_ip_from_conf():
     """Read the robot IP from example/wrapper/robot.conf, returning '' on failure."""
     conf_path = os.path.join(os.path.dirname(__file__), '../example/wrapper/robot.conf')
@@ -315,9 +378,30 @@ def _detect_rot_magnitude(words):
     return ROT_STEP['normal']
 
 
-def _tokenize(text):
-    """Lowercase and strip punctuation, return a set of words."""
-    return set(re.sub(r'[^\w\s]', '', text.lower()).split())
+# Phrase aliases: (regex pattern, canonical replacement). Applied in order on
+# the cleaned utterance before command parsing, so any alias on the left is
+# interpreted as if the user had spoken the phrase on the right. Add new
+# aliases here — they require no other code changes.
+#
+# Ordering rules:
+#   • Put multi-word aliases before single-word ones that could be substrings.
+#   • Use \b word boundaries so "origin" doesn't match inside "origins".
+#   • Use negative lookbehinds when an alias is a substring of an existing
+#     canonical phrase (e.g. "home" alone → "go home", but not inside
+#     "go home" which is already the canonical form).
+COMMAND_ALIASES = [
+    (r'\btoes?\s+in\b',        'roll left'),
+    (r'\btoes?\s+out\b',       'roll right'),
+    (r'\borigin\b',            'go home'),
+    (r'(?<!go\s)\bhome\b',     'go home'),
+]
+
+
+def _apply_aliases(cleaned):
+    """Apply COMMAND_ALIASES substitutions to an already-cleaned utterance."""
+    for pattern, replacement in COMMAND_ALIASES:
+        cleaned = re.sub(pattern, replacement, cleaned)
+    return cleaned
 
 
 def parse_command(text):
@@ -333,12 +417,12 @@ def parse_command(text):
       ('gripper_close', label)
       None
     """
-    words = _tokenize(text)
+    cleaned = _apply_aliases(re.sub(r'[^\w\s]', '', text.lower()))
+    words = set(cleaned.split())
 
     if 'stop' in words:
         return ('stop', 'Emergency Stop')
     # Require the exact adjacent phrase to avoid hallucinated single words
-    cleaned = re.sub(r'[^\w\s]', '', text.lower())
     if 'go home' in cleaned:
         return ('home', 'Go Home')
     if 'engage' in words:
@@ -489,10 +573,24 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
     on_mic_state("Stopped")
 
 
-def execute_loop(arm, gripper, cmd_queue, stop_event, on_active, on_done, on_log):
+def execute_loop(arm, gripper, cmd_queue, stop_event,
+                 on_active, on_done, on_log,
+                 get_state, set_state, on_illegal):
     """
     Drains cmd_queue and executes each command on the arm or gripper.
-    If arm is None (demo mode), arm commands are logged but not sent.
+
+    Preset-position moves ('home', 'extend', 'engage', 'retract') are gated
+    by the STATE_TRANSITIONS graph. If the transition is illegal, the arm
+    pose is checked against the target radius + joint tolerance; if that also
+    fails, on_illegal(target, current) is invoked and the move is skipped.
+
+    Manual Cartesian 'move' / 'rotate' commands clear the tracked state so
+    subsequent preset moves require either a re-entry via a legal source or
+    a proximity override.
+
+    If arm is None (demo mode), arm commands are logged but not sent. The
+    state machine is still enforced; override is not available in demo since
+    the arm can't be queried.
     Gripper commands are always executed if gripper is not None.
     Calls on_active(label) when a command starts, on_done() when it finishes.
     """
@@ -503,38 +601,62 @@ def execute_loop(arm, gripper, cmd_queue, stop_event, on_active, on_done, on_log
             continue
 
         label = _cmd_label(cmd)
+        kind = cmd[0]
         on_active(label)
 
-        is_gripper_cmd = cmd[0] in ('gripper_open', 'gripper_close')
-
-        if is_gripper_cmd:
-            if gripper is None:
-                on_log(f"[DEMO] Would execute: {label}")
-                import time; time.sleep(0.4)
-            else:
-                on_log(f"Executing: {label}")
-                try:
-                    if cmd[0] == 'gripper_open':
+        try:
+            if kind in ('gripper_open', 'gripper_close'):
+                if gripper is None:
+                    on_log(f"[DEMO] Would execute: {label}")
+                    import time; time.sleep(0.4)
+                else:
+                    on_log(f"Executing: {label}")
+                    if kind == 'gripper_open':
                         gripper.open()
-                    elif cmd[0] == 'gripper_close':
+                    else:
                         gripper.close()
-                except Exception as e:
-                    on_log(f"Gripper error during '{label}': {e}")
-        elif arm is None:
-            on_log(f"[DEMO] Would execute: {label}")
-            import time; time.sleep(0.4)
-        else:
-            on_log(f"Executing: {label}")
-            try:
-                if cmd[0] == 'stop':
+
+            elif kind == 'stop':
+                if arm is None:
+                    on_log(f"[DEMO] Would execute: {label}")
+                else:
+                    on_log(f"Executing: {label}")
                     arm.emergency_stop()
-                elif cmd[0] in ('home', 'extend', 'engage', 'retract'):
-                    arm.set_servo_angle(
-                        angle=JOINT_POSITIONS[cmd[0]],
-                        speed=30, wait=True,
-                    )
-                elif cmd[0] == 'move':
-                    _, dx, dy, dz, _ = cmd
+                set_state(None)
+
+            elif kind in ('home', 'extend', 'engage', 'retract'):
+                target = kind
+                current = get_state()
+                allowed_sources = STATE_TRANSITIONS.get(target, set())
+                legal = current in allowed_sources
+                override = False if legal else _can_override_transition(arm, target)
+
+                if not legal and not override:
+                    on_log(f"ILLEGAL transition blocked: "
+                           f"{current or 'unknown'} → {target}")
+                    on_illegal(target, current)
+                else:
+                    if override:
+                        on_log(f"Override allowed for '{target}' "
+                               f"(within radius + joint tolerance).")
+                    if arm is None:
+                        on_log(f"[DEMO] Would execute: {label}")
+                        import time; time.sleep(0.4)
+                    else:
+                        on_log(f"Executing: {label}")
+                        arm.set_servo_angle(
+                            angle=JOINT_POSITIONS[target],
+                            speed=30, wait=True,
+                        )
+                    set_state(target)
+
+            elif kind == 'move':
+                _, dx, dy, dz, _ = cmd
+                if arm is None:
+                    on_log(f"[DEMO] Would execute: {label}")
+                    import time; time.sleep(0.4)
+                else:
+                    on_log(f"Executing: {label}")
                     arm.set_position(
                         x=dx, y=dy, z=dz,
                         roll=0, pitch=0, yaw=0,
@@ -542,8 +664,15 @@ def execute_loop(arm, gripper, cmd_queue, stop_event, on_active, on_done, on_log
                         speed=SPEED,
                         wait=True,
                     )
-                elif cmd[0] == 'rotate':
-                    _, droll, dpitch, dyaw, _ = cmd
+                set_state(None)
+
+            elif kind == 'rotate':
+                _, droll, dpitch, dyaw, _ = cmd
+                if arm is None:
+                    on_log(f"[DEMO] Would execute: {label}")
+                    import time; time.sleep(0.4)
+                else:
+                    on_log(f"Executing: {label}")
                     arm.set_position(
                         x=0, y=0, z=0,
                         roll=droll, pitch=dpitch, yaw=dyaw,
@@ -551,8 +680,10 @@ def execute_loop(arm, gripper, cmd_queue, stop_event, on_active, on_done, on_log
                         speed=SPEED,
                         wait=True,
                     )
-            except Exception as e:
-                on_log(f"Arm error during '{label}': {e}")
+                set_state(None)
+
+        except Exception as e:
+            on_log(f"Error during '{label}': {e}")
 
         cmd_queue.task_done()
         on_done()
@@ -643,6 +774,10 @@ class VoiceControlApp:
         self.exec_thread = None
         self.cmd_queue = queue.Queue()
         self.tool_var = tk.StringVar(value=next(iter(TOOL_OFFSETS)))
+        # Tracked preset-position state for the STATE_TRANSITIONS graph.
+        # None means "unknown" — any preset move requires a proximity override.
+        self.current_state = None
+        self._state_lock = threading.Lock()
 
         # Attempt to connect to the DexHand gripper at startup
         try:
@@ -1058,6 +1193,7 @@ class VoiceControlApp:
             self.arm.disconnect()
             self.arm = None
         self._session_active = False
+        self._set_state(None)
         self._log("Disconnected.")
         self.status_badge.config(text="  OFFLINE  ", bg='#2e2e2e')
         self.btn_connect.config(state='normal', bg=C['green'])
@@ -1091,7 +1227,8 @@ class VoiceControlApp:
         self.exec_thread = threading.Thread(
             target=execute_loop,
             args=(self.arm, self.gripper, self.cmd_queue, self.stop_event,
-                  self._set_active, self._on_cmd_done, self._log),
+                  self._set_active, self._on_cmd_done, self._log,
+                  self._get_state, self._set_state, self._on_illegal_transition),
             daemon=True,
         )
         self.voice_thread.start()
@@ -1117,6 +1254,7 @@ class VoiceControlApp:
             self._log("EMERGENCY STOP sent.")
         else:
             self._log("[DEMO] EMERGENCY STOP simulated.")
+        self._set_state(None)
         self._set_active('—')
         self.queue_listbox.delete(0, 'end')
         while not self.cmd_queue.empty():
@@ -1124,6 +1262,33 @@ class VoiceControlApp:
                 self.cmd_queue.get_nowait()
             except queue.Empty:
                 break
+
+    # --- State-machine helpers --------------------------------------------
+
+    def _get_state(self):
+        with self._state_lock:
+            return self.current_state
+
+    def _set_state(self, value):
+        with self._state_lock:
+            self.current_state = value
+        self.root.after(0, lambda: self._log(
+            f"State → {value if value is not None else 'unknown'}"))
+
+    def _on_illegal_transition(self, target, current):
+        """Called from the executor thread when a preset transition is blocked.
+        Schedules a modal warning popup on the main thread."""
+        allowed = sorted(STATE_TRANSITIONS.get(target, set())) or ['(none)']
+        radius = POSITION_RADII.get(target, 0.0)
+        msg = (
+            f"Cannot move to '{target}' from '{current or 'unknown'}'.\n\n"
+            f"Allowed source states: {', '.join(allowed)}\n\n"
+            f"Override is only permitted when the TCP is within "
+            f"{radius:.0f} mm of the target pose AND every joint is within "
+            f"{JOINT_TOLERANCE:.0f}° of the target joint angles."
+        )
+        self.root.after(
+            0, lambda: messagebox.showwarning("Illegal Transition", msg))
 
     def _on_arm_error(self, item):
         """Registered xArm error/warn callback — logs the error and warn codes."""
