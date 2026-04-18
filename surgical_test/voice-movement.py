@@ -33,7 +33,6 @@ Voice commands:
   "pitch up/down [qualifier]"    → ±Pitch
   "yaw left/right [qualifier]"   → ±Yaw
   "go home"                    → return to home position
-  "pickup"                     → move to pickup position
   "engage"                     → move to engage position
   "extend"                     → move to extend position
   "retract"                    → move to retract position
@@ -213,9 +212,8 @@ SPEED = 50  # mm/s
 # Hardcoded joint-angle positions [j1..j7] (degrees).  Edit these to match
 # your robot's actual setpoints.
 JOINT_POSITIONS = {
-    'home':    [25, -71, 318, 45, -47, 99, -6], 
-    'pickup':    [25, -71, 318, 45, -47, 99, -6], 
-    'extend':  [173, -94, 274, 123, -184, 133, 9],  
+    'home':    [25, -71, 318, 45, -47, 99, -6],
+    'extend':  [173, -94, 274, 123, -184, 133, 9],
     'engage':  [173, -101, 274, 123, -184, 133, 9], 
     'retract':  [172, -112, 312, 122, -184, 133, 9],  
 }
@@ -343,8 +341,6 @@ def parse_command(text):
     cleaned = re.sub(r'[^\w\s]', '', text.lower())
     if 'go home' in cleaned:
         return ('home', 'Go Home')
-    if 'pickup' in words or 'pick up' in cleaned:
-        return ('pickup', 'Go to Pickup')
     if 'engage' in words:
         return ('engage', 'Go to Engage')
     if 'extend' in words:
@@ -433,7 +429,7 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
     _PROMPT = ("move forward a little, move backward more, move left a lot, "
                "move right slightly, move up, move down, "
                "roll left, roll right a little, pitch up more, pitch down, yaw left, yaw right a lot, "
-               "go home, pickup, engage, extend, retract, stop, open, close")
+               "go home, engage, extend, retract, stop, open, close")
 
     with mic as source:
         on_mic_state("Calibrating microphone…")
@@ -532,7 +528,7 @@ def execute_loop(arm, gripper, cmd_queue, stop_event, on_active, on_done, on_log
             try:
                 if cmd[0] == 'stop':
                     arm.emergency_stop()
-                elif cmd[0] in ('home', 'pickup', 'extend', 'engage', 'retract'):
+                elif cmd[0] in ('home', 'extend', 'engage', 'retract'):
                     arm.set_servo_angle(
                         angle=JOINT_POSITIONS[cmd[0]],
                         speed=30, wait=True,
@@ -691,7 +687,6 @@ class VoiceControlApp:
         cmd_menu.add_command(label='"yaw left/right [qualifier]"   →  ±Yaw',  state='disabled')
         cmd_menu.add_separator()
         cmd_menu.add_command(label='"go home"               →  return to home position', state='disabled')
-        cmd_menu.add_command(label='"pickup"                →  move to pickup position', state='disabled')
         cmd_menu.add_command(label='"engage"                →  move to engage position', state='disabled')
         cmd_menu.add_command(label='"extend"                →  move to extend position', state='disabled')
         cmd_menu.add_command(label='"retract"               →  move to retract position', state='disabled')
@@ -870,7 +865,6 @@ class VoiceControlApp:
             ('pitch up/down [qualifier]',   '±Pitch  (2 / 10 / 20 / 45°)'),
             ('yaw left/right [qualifier]',  '±Yaw   (2 / 10 / 20 / 45°)'),
             ('go home',                     'move to home position'),
-            ('pickup',                      'move to pickup position'),
             ('engage',                      'move to engage position'),
             ('extend',                      'move to extend position'),
             ('retract',                     'move to retract position'),
