@@ -35,6 +35,7 @@ Voice commands:
   "go home"                    → return to home position
   "pickup"                     → move to pickup position
   "engage"                     → move to engage position
+  "extend"                     → move to extend position
   "retract"                    → move to retract position
   "stop"                       → emergency stop
   "open"                       → open DexHand gripper
@@ -212,17 +213,11 @@ SPEED = 50  # mm/s
 # Hardcoded joint-angle positions [j1..j7] (degrees).  Edit these to match
 # your robot's actual setpoints.
 JOINT_POSITIONS = {
-    # 'home': [-86.9, 81.1, 132.1, 53, -71.4, 102.1, 47.8],
-    # 'home':    [-9.3,  2.8,  10.4, 24.5,  92.9, 1.7,  -90.4],
-    # 'pickup':  [-9.3,  2.8,  10.4, 24.5,  92.9, 163.6,  -90.4],  
-    # 'home':    [-95.4,  93,  100.5, 19.9,  -87.1, 92.7,  2.9],
-    # 'pickup':    [-95.4,  93,  100.5, 19.9,  -266.4, 92.7,  2.9],
-    'home':    [-156,  93,  97, 26,  -93, 94,  -95],
-    'pickup':    [-139,  91,  98, 34.5,  -48, 15,  -17],
-    'engage':  [-83,  91,  97,  59,  -100,  88.9,  38.2],  
-    'retract':  [-87,  91,  95,  63,  -100,  89,  28],  
-    # 'engage':  [-2.5,  30.3,  3.6,  53.3,  49.4,  2.2,  -48],
-    # 'retract': [-2.5,  30.3,  3.6,  53.3,  49.4,  2.2,  -48],
+    'home':    [25, -71, 318, 45, -47, 99, -6], 
+    'pickup':    [25, -71, 318, 45, -47, 99, -6], 
+    'extend':  [173, -94, 274, 123, -184, 133, 9],  
+    'engage':  [173, -101, 274, 123, -184, 133, 9], 
+    'retract':  [172, -112, 312, 122, -184, 133, 9],  
 }
 
 # TCP offsets per tool: [x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg]
@@ -230,11 +225,9 @@ JOINT_POSITIONS = {
 # All values are placeholders — calibrate for each physical tool.
 TOOL_OFFSETS = {
     'None (flange)':  [  0,   0,   0,   0,  0,  0],
-    'Retractor':      [  0,   0, 150,   0,  0,  0],
-    'Scissors':       [  0,   0, 180,   0,  0,  0],
-    'Forceps':        [  0,   0, 200,   0,  0,  0],
-    'Needle Driver':  [  0,   0, 195,   0,  0,  0],
-    'Cautery Hook':   [  0,   0, 170,  15,  0,  0],
+    'big curvy one':       [  180, -150,  0,   0,  0,  0],
+    'thin pointy one':       [  180, -150,  0,   0,  0,  0], # only tuned for thin pointy one
+    'army navy one':       [  180, -150,  0,   0,  0,  0],
 }
 
 # RMS amplitude below which audio is considered silence and skipped (0–1 scale).
@@ -354,6 +347,8 @@ def parse_command(text):
         return ('pickup', 'Go to Pickup')
     if 'engage' in words:
         return ('engage', 'Go to Engage')
+    if 'extend' in words:
+        return ('extend', 'Go to Extend')
     if 'retract' in words:
         return ('retract', 'Go to Retract')
     if 'open' in words:
@@ -438,7 +433,7 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
     _PROMPT = ("move forward a little, move backward more, move left a lot, "
                "move right slightly, move up, move down, "
                "roll left, roll right a little, pitch up more, pitch down, yaw left, yaw right a lot, "
-               "go home, pickup, engage, retract, stop, open, close")
+               "go home, pickup, engage, extend, retract, stop, open, close")
 
     with mic as source:
         on_mic_state("Calibrating microphone…")
@@ -537,7 +532,7 @@ def execute_loop(arm, gripper, cmd_queue, stop_event, on_active, on_done, on_log
             try:
                 if cmd[0] == 'stop':
                     arm.emergency_stop()
-                elif cmd[0] in ('home', 'pickup', 'engage', 'retract'):
+                elif cmd[0] in ('home', 'pickup', 'extend', 'engage', 'retract'):
                     arm.set_servo_angle(
                         angle=JOINT_POSITIONS[cmd[0]],
                         speed=30, wait=True,
@@ -698,6 +693,7 @@ class VoiceControlApp:
         cmd_menu.add_command(label='"go home"               →  return to home position', state='disabled')
         cmd_menu.add_command(label='"pickup"                →  move to pickup position', state='disabled')
         cmd_menu.add_command(label='"engage"                →  move to engage position', state='disabled')
+        cmd_menu.add_command(label='"extend"                →  move to extend position', state='disabled')
         cmd_menu.add_command(label='"retract"               →  move to retract position', state='disabled')
         cmd_menu.add_command(label='"stop"                  →  emergency stop',          state='disabled')
         cmd_menu.add_separator()
@@ -876,6 +872,7 @@ class VoiceControlApp:
             ('go home',                     'move to home position'),
             ('pickup',                      'move to pickup position'),
             ('engage',                      'move to engage position'),
+            ('extend',                      'move to extend position'),
             ('retract',                     'move to retract position'),
             ('stop',                        'emergency stop'),
             ('open',                        'open DexHand gripper'),
