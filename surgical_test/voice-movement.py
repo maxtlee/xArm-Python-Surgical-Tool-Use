@@ -213,9 +213,9 @@ SPEED = 50  # mm/s
 # your robot's actual setpoints.
 JOINT_POSITIONS = {
     'home':    [25, -71, 318, 45, -47, 99, -6],
-    'extend':  [173, -94, 274, 123, -184, 133, 9],
-    'engage':  [173, -101, 274, 123, -184, 133, 9], 
-    'retract':  [172, -112, 312, 122, -184, 133, 9],  
+    'extend':  [155, -92, 271, 95, -179, 149, 0],
+    'engage':  [154, -99, 271, 95, -182, 149, 0], 
+    'retract':  [152, -113, 298, 95, -178, 149, 0]
 }
 
 # TCP offsets per tool: [x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg]
