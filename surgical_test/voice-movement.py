@@ -298,8 +298,8 @@ ROTATION_MAP = {
 # moves/rotations clear the state.
 
 STATE_TRANSITIONS = {
-    'home':    {('extend',  40)},
-    'extend':  {('engage',  10), ('home',    40)},
+    'home':    {('extend',  60)},
+    'extend':  {('engage',  10), ('home',    60)},
     'engage':  {('extend',  10), ('retract', 10)},
     'retract': {('engage',  10)},
 }
@@ -335,7 +335,13 @@ POSITION_RADII = {
 }
 
 # Per-joint tolerance (degrees) required for override in addition to radius.
-JOINT_TOLERANCE = 45.0
+JOINT_TOLERANCE = {
+    'home':    60.0,
+    'extend':  45.0,
+    'engage':  45.0,
+    'retract': 45.0,
+}
+_DEFAULT_JOINT_TOLERANCE = 45.0
 
 
 def _can_override_transition(arm, target):
@@ -349,12 +355,13 @@ def _can_override_transition(arm, target):
     if arm is None or target not in JOINT_POSITIONS:
         return False
     target_joints = JOINT_POSITIONS[target]
+    tol = JOINT_TOLERANCE.get(target, _DEFAULT_JOINT_TOLERANCE)
 
     code, current_joints = arm.get_servo_angle()
     if code != 0 or current_joints is None:
         return False
     for c, t in zip(current_joints, target_joints):
-        if abs(c - t) > JOINT_TOLERANCE:
+        if abs(c - t) > tol:
             return False
 
     code, current_pose = arm.get_position()
@@ -602,7 +609,7 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
 
 def execute_loop(arm, gripper, cmd_queue, stop_event,
                  on_active, on_done, on_log,
-                 get_state, set_state, on_illegal):
+                 get_state, set_state, on_illegal, estop_event):
     """
     Drains cmd_queue and executes each command on the arm or gripper.
 
@@ -651,6 +658,26 @@ def execute_loop(arm, gripper, cmd_queue, stop_event,
                     arm.emergency_stop()
                 set_state(None)
 
+            elif kind == 'force_home':
+                # Bypass the state machine entirely — used by the "Force Home"
+                # GUI button. Slow speed since the starting pose is unknown.
+                speed = 20
+                if arm is None:
+                    on_log(f"[DEMO] Would execute: {label} @ {speed}°/s")
+                    import time; time.sleep(0.4)
+                else:
+                    on_log(f"FORCE: {label} @ {speed}°/s (bypassing state machine)")
+                    arm.set_servo_angle(
+                        angle=JOINT_POSITIONS['home'],
+                        speed=speed, wait=True,
+                    )
+                if estop_event.is_set():
+                    on_log("Force Home interrupted by stop — state cleared.")
+                    set_state(None)
+                    estop_event.clear()
+                else:
+                    set_state('home')
+
             elif kind in ('home', 'extend', 'engage', 'retract'):
                 target = kind
                 current = get_state()
@@ -677,7 +704,12 @@ def execute_loop(arm, gripper, cmd_queue, stop_event,
                             angle=JOINT_POSITIONS[target],
                             speed=speed, wait=True,
                         )
-                    set_state(target)
+                    if estop_event.is_set():
+                        on_log(f"Move to '{target}' interrupted by stop — state cleared.")
+                        set_state(None)
+                        estop_event.clear()
+                    else:
+                        set_state(target)
 
             elif kind == 'move':
                 _, dx, dy, dz, _ = cmd
@@ -798,9 +830,12 @@ class VoiceControlApp:
         self.arm = None
         self.gripper = None
         self._session_active = False  # True when connected or in demo mode
-        self.stop_event = threading.Event()
+        self.listen_stop_event = threading.Event()
+        self.exec_stop_event = threading.Event()
+        self.estop_event = threading.Event()
         self.voice_thread = None
         self.exec_thread = None
+        self.keyboard_active = False
         self.cmd_queue = queue.Queue()
         self.tool_var = tk.StringVar(value=next(iter(TOOL_OFFSETS)))
         # Tracked preset-position state for the STATE_TRANSITIONS graph.
@@ -819,6 +854,48 @@ class VoiceControlApp:
             self._gripper_init_error = None
 
         self._build_ui()
+        self.root.bind_all('<space>', self._on_space_stop)
+
+    def _on_space_stop(self, event):
+        """Spacebar triggers a soft stop, except while an *editable* text
+        widget actually has focus (so typing spaces into the IP field isn't
+        hijacked). A focused-but-disabled Text (e.g. the log) does not count."""
+        focused = self.root.focus_get()
+        if isinstance(focused, (tk.Entry, tk.Text)):
+            try:
+                if str(focused.cget('state')) == 'normal':
+                    return
+            except tk.TclError:
+                pass
+        if self._session_active:
+            self._on_soft_stop()
+
+    def _on_soft_stop(self):
+        """Non-emergency stop: drop into state 4 to halt the current motion,
+        then restore state 0 so the robot is immediately ready for new
+        commands. Clears the tracked state (interrupted mid-transition) and
+        flushes the pending queue.
+
+        Sets estop_event *before* issuing the stop so when the blocked move
+        call on the executor thread returns, it sees the flag and clears the
+        tracked state instead of claiming the target it never reached. (Same
+        race as the E-stop path.)
+        """
+        self.estop_event.set()
+        if self.arm:
+            self.arm.set_state(4)   # stop current motion
+            self.arm.set_state(0)   # re-enable motion state for next command
+            self._log("Soft stop — motion halted, robot ready for new commands.")
+        else:
+            self._log("[DEMO] Soft stop simulated.")
+        self._set_state(None)
+        self._set_active('—')
+        self.queue_listbox.delete(0, 'end')
+        while not self.cmd_queue.empty():
+            try:
+                self.cmd_queue.get_nowait()
+            except queue.Empty:
+                break
 
     # --- UI construction ---------------------------------------------------
 
@@ -928,8 +1005,8 @@ class VoiceControlApp:
         _btn(trow, "Apply Now", lambda: self._apply_tcp_offset(log=True),
              C['green'], C['green_dk'], width=10).grid(row=0, column=3, padx=4)
 
-        # ── Voice control ───────────────────────────────────────────────────
-        s_out, s_in = _section(main, "Voice Control")
+        # ── Input controls ──────────────────────────────────────────────────
+        s_out, s_in = _section(main, "Input Controls")
         s_out.pack(fill='x', pady=(4, 0), **P)
 
         vrow = tk.Frame(s_in, bg=C['surface'])
@@ -939,9 +1016,17 @@ class VoiceControlApp:
                               C['blue'], C['blue_dk'], state='disabled', width=18)
         self.btn_start.pack(side='left', padx=(0, 8))
 
-        self.btn_stop_listen = _btn(vrow, "Stop Listening", self._on_stop_listening,
-                                    C['grey'], C['grey_dk'], state='disabled', width=18)
-        self.btn_stop_listen.pack(side='left', padx=(0, 16))
+        self.btn_start_kb = _btn(vrow, "Start Keyboard Control", self._on_start_keyboard,
+                                 C['blue'], C['blue_dk'], state='disabled', width=22)
+        self.btn_start_kb.pack(side='left', padx=(0, 8))
+
+        self.btn_stop_all = _btn(vrow, "Stop All", self._on_stop_all,
+                                 C['grey'], C['grey_dk'], state='disabled', width=14)
+        self.btn_stop_all.pack(side='left', padx=(0, 16))
+
+        self.btn_force_home = _btn(vrow, "Force Home", self._on_force_home,
+                                   C['orange'], C['orange_dk'], state='disabled', width=14)
+        self.btn_force_home.pack(side='left', padx=(0, 16))
 
         self.btn_estop = _btn(vrow, "EMERGENCY STOP", self._on_estop,
                               C['red'], C['red_dk'], state='disabled', width=18, big=True)
@@ -1177,7 +1262,13 @@ class VoiceControlApp:
         self.btn_demo.config(state='disabled')
         self.btn_disconnect.config(state='normal', bg=C['grey'])
         self.btn_start.config(state='normal', bg=C['blue'])
+        self.btn_start_kb.config(state='normal', bg=C['blue'])
+        self.btn_force_home.config(state='normal', bg=C['orange'])
         self.btn_estop.config(state='normal', bg=C['red'])
+        self._ensure_executor()
+        # Release IP Entry focus so the spacebar soft-stop binding isn't
+        # swallowed by the Entry's edit mode.
+        self.root.focus_set()
 
     def _on_connect(self):
         """Connect to the robot at the entered IP, enable motion, and set
@@ -1208,7 +1299,13 @@ class VoiceControlApp:
         self.btn_connect.config(state='disabled')
         self.btn_disconnect.config(state='normal', bg=C['grey'])
         self.btn_start.config(state='normal', bg=C['blue'])
+        self.btn_start_kb.config(state='normal', bg=C['blue'])
+        self.btn_force_home.config(state='normal', bg=C['orange'])
         self.btn_estop.config(state='normal', bg=C['red'])
+        self._ensure_executor()
+        # Release IP Entry focus so the spacebar soft-stop binding isn't
+        # swallowed by the Entry's edit mode.
+        self.root.focus_set()
         if self.gripper is not None:
             self.status_badge.config(text="  LIVE  ", bg='#8f0d22')
         else:
@@ -1217,11 +1314,12 @@ class VoiceControlApp:
     def _on_disconnect(self):
         """Stop listening, disconnect the arm, and reset all buttons to their
         disconnected state."""
-        self._on_stop_listening()
+        self._session_active = False
+        self._on_stop_all()
+        self.exec_stop_event.set()
         if self.arm:
             self.arm.disconnect()
             self.arm = None
-        self._session_active = False
         self._set_state(None)
         self._log("Disconnected.")
         self.status_badge.config(text="  OFFLINE  ", bg='#2e2e2e')
@@ -1229,15 +1327,27 @@ class VoiceControlApp:
         self.btn_demo.config(state='normal', bg=C['orange'])
         self.btn_disconnect.config(state='disabled', bg=C['grey_dk'])
         self.btn_start.config(state='disabled', bg=C['blue_dk'])
-        self.btn_stop_listen.config(state='disabled', bg=C['grey_dk'])
+        self.btn_start_kb.config(state='disabled', bg=C['blue_dk'])
+        self.btn_stop_all.config(state='disabled', bg=C['grey_dk'])
+        self.btn_force_home.config(state='disabled', bg=C['orange_dk'])
         self.btn_estop.config(state='disabled', bg=C['red_dk'])
 
-    def _on_start(self):
-        """Clear any stale queue, then launch the listen and execute daemon
-        threads. No-ops if a listen session is already running."""
-        if self.voice_thread and self.voice_thread.is_alive():
+    def _ensure_executor(self):
+        """Start the executor thread if it isn't already running."""
+        if self.exec_thread and self.exec_thread.is_alive():
             return
-        # Clear stale queue display
+        self.exec_stop_event.clear()
+        self.exec_thread = threading.Thread(
+            target=execute_loop,
+            args=(self.arm, self.gripper, self.cmd_queue, self.exec_stop_event,
+                  self._set_active, self._on_cmd_done, self._log,
+                  self._get_state, self._set_state, self._on_illegal_transition,
+                  self.estop_event),
+            daemon=True,
+        )
+        self.exec_thread.start()
+
+    def _clear_queue(self):
         self.queue_listbox.delete(0, 'end')
         while not self.cmd_queue.empty():
             try:
@@ -1245,39 +1355,91 @@ class VoiceControlApp:
             except queue.Empty:
                 break
 
-        self.stop_event.clear()
+    def _on_start(self):
+        """Launch the voice listener daemon thread. Executor is started on
+        session activation and stays up independently."""
+        if self.voice_thread and self.voice_thread.is_alive():
+            return
+        self._clear_queue()
+        self._ensure_executor()
+        self.listen_stop_event.clear()
 
         self.voice_thread = threading.Thread(
             target=listen_loop,
-            args=(self.cmd_queue, self.stop_event,
+            args=(self.cmd_queue, self.listen_stop_event,
                   self._set_mic_state, self._on_heard),
             daemon=True,
         )
-        self.exec_thread = threading.Thread(
-            target=execute_loop,
-            args=(self.arm, self.gripper, self.cmd_queue, self.stop_event,
-                  self._set_active, self._on_cmd_done, self._log,
-                  self._get_state, self._set_state, self._on_illegal_transition),
-            daemon=True,
-        )
         self.voice_thread.start()
-        self.exec_thread.start()
 
         self.btn_start.config(state='disabled')
-        self.btn_stop_listen.config(state='normal')
+        self.btn_stop_all.config(state='normal')
         self._log("Voice listener started.")
 
-    def _on_stop_listening(self):
-        """Signal both daemon threads to stop via the shared stop_event."""
-        self.stop_event.set()
-        self.btn_start.config(state='normal' if self._session_active else 'disabled')
-        self.btn_stop_listen.config(state='disabled')
-        self._set_mic_state("Stopped")
+    def _on_start_keyboard(self):
+        """Bind number keys 1-4 to preset moves. Keys fire only while this
+        control is active — Stop All clears the bindings."""
+        if self.keyboard_active:
+            return
+        self._ensure_executor()
+        self.keyboard_active = True
+        self.root.bind_all('<Key-1>', lambda e: self._keyboard_cmd('home',    'Go Home'))
+        self.root.bind_all('<Key-2>', lambda e: self._keyboard_cmd('extend',  'Go to Extend'))
+        self.root.bind_all('<Key-3>', lambda e: self._keyboard_cmd('engage',  'Go to Engage'))
+        self.root.bind_all('<Key-4>', lambda e: self._keyboard_cmd('retract', 'Go to Retract'))
+
+        self.btn_start_kb.config(state='disabled')
+        self.btn_stop_all.config(state='normal')
+        self._log("Keyboard control started — 1=Home  2=Extend  3=Engage  4=Retract.")
+
+    def _keyboard_cmd(self, kind, label):
+        """Enqueue a preset-move command from a keyboard press."""
+        cmd = (kind, label)
+        self.cmd_queue.put(cmd)
+        self._enqueue_display(cmd)
+        self._log(f"Keyboard: {label}")
+
+    def _on_stop_all(self):
+        """Stop the voice listener and unbind the keyboard controls."""
+        self.listen_stop_event.set()
+        if self.keyboard_active:
+            for k in ('<Key-1>', '<Key-2>', '<Key-3>', '<Key-4>'):
+                self.root.unbind_all(k)
+            self.keyboard_active = False
+            self._log("Keyboard control stopped.")
         self._log("Voice listener stopped.")
+        self._set_mic_state("Stopped")
+        enabled = 'normal' if self._session_active else 'disabled'
+        self.btn_start.config(state=enabled)
+        self.btn_start_kb.config(state=enabled)
+        self.btn_stop_all.config(state='disabled')
+
+    def _on_force_home(self):
+        """Enqueue a state-machine-bypassing move to the home preset.
+
+        Confirms first since this skips the normal transition gating.
+        """
+        if not messagebox.askyesno(
+            "Force Home",
+            "Force move to HOME from the current pose, bypassing the "
+            "state-machine transition check?\n\n"
+            "Only use this when the arm is in a known-safe configuration."
+        ):
+            return
+        cmd = ('force_home', 'FORCE Home')
+        self.cmd_queue.put(cmd)
+        self._enqueue_display(cmd)
+        self._log("Force Home requested — state machine bypassed.")
 
     def _on_estop(self):
         """Send an immediate emergency stop to the arm (or simulate in demo mode),
-        then clear the pending command queue and display."""
+        then clear the pending command queue and display.
+
+        Sets estop_event *before* triggering the stop so that when the blocked
+        move call on the executor thread returns, it sees the flag and clears
+        the tracked state instead of claiming the target it never reached.
+        """
+        self.estop_event.set()
         if self.arm:
             self.arm.emergency_stop()
             self._log("EMERGENCY STOP sent.")
@@ -1309,12 +1471,13 @@ class VoiceControlApp:
         Schedules a modal warning popup on the main thread."""
         allowed = sorted(_allowed_sources(target)) or ['(none)']
         radius = POSITION_RADII.get(target, 0.0)
+        tol = JOINT_TOLERANCE.get(target, _DEFAULT_JOINT_TOLERANCE)
         msg = (
             f"Cannot move to '{target}' from '{current or 'unknown'}'.\n\n"
             f"Allowed source states: {', '.join(allowed)}\n\n"
             f"Override is only permitted when the TCP is within "
             f"{radius:.0f} mm of the target pose AND every joint is within "
-            f"{JOINT_TOLERANCE:.0f}° of the target joint angles."
+            f"{tol:.0f}° of the target joint angles."
         )
         self.root.after(
             0, lambda: messagebox.showwarning("Illegal Transition", msg))
