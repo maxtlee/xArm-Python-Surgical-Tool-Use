@@ -51,7 +51,7 @@ import sys
 import queue
 import threading
 import tkinter as tk
-from tkinter import scrolledtext, font as tkfont, messagebox
+from tkinter import scrolledtext, font as tkfont
 import numpy as np
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
@@ -1404,12 +1404,14 @@ class VoiceControlApp:
         self.root.bind_all('<Key-2>', lambda e: self._keyboard_cmd('extend',  'Go to Extend'))
         self.root.bind_all('<Key-3>', lambda e: self._keyboard_cmd('engage',  'Go to Engage'))
         self.root.bind_all('<Key-4>', lambda e: self._keyboard_cmd('retract', 'Go to Retract'))
+        self.root.bind_all('<Key-6>', lambda e: self._keyboard_cmd('gripper_open',  'Open Gripper'))
+        self.root.bind_all('<Key-7>', lambda e: self._keyboard_cmd('gripper_close', 'Close Gripper'))
         self.root.bind_all('<Key-0>', lambda e: self._on_start_demo_loop())
 
         self.btn_start_kb.config(state='disabled')
         self.btn_stop_all.config(state='normal')
         self._log("Keyboard control started — 1=Home  2=Extend  3=Engage  "
-                  "4=Retract  0=Demo Loop.")
+                  "4=Retract  6=Open  7=Close  0=Demo Loop.")
 
     def _keyboard_cmd(self, kind, label):
         """Enqueue a preset-move command from a keyboard press."""
@@ -1422,7 +1424,8 @@ class VoiceControlApp:
         """Stop the voice listener, keyboard bindings, and demo loop."""
         self.listen_stop_event.set()
         if self.keyboard_active:
-            for k in ('<Key-0>', '<Key-1>', '<Key-2>', '<Key-3>', '<Key-4>'):
+            for k in ('<Key-0>', '<Key-1>', '<Key-2>', '<Key-3>', '<Key-4>',
+                      '<Key-6>', '<Key-7>'):
                 self.root.unbind_all(k)
             self.keyboard_active = False
             self._log("Keyboard control stopped.")
@@ -1483,12 +1486,10 @@ class VoiceControlApp:
 
         start = self._pick_demo_start_state()
         if start is None:
-            msg = ("Demo loop cannot start: no tracked state and the arm is "
-                   "not within any preset's override radius + joint "
-                   "tolerance. Move to a known preset (e.g. Force Home) "
-                   "first.")
-            self._log(msg)
-            messagebox.showwarning("Demo Loop", msg)
+            self._log("Demo loop cannot start: no tracked state and the arm "
+                      "is not within any preset's override radius + joint "
+                      "tolerance. Move to a known preset (e.g. Force Home) "
+                      "first.")
             return
 
         # If we found the start via proximity override, adopt it as the
@@ -1562,21 +1563,12 @@ class VoiceControlApp:
             self.btn_start_demo.config(state='normal', bg=C['blue'])
 
     def _on_force_home(self):
-        """Enqueue a state-machine-bypassing move to the home preset.
-
-        Confirms first since this skips the normal transition gating.
-        """
-        if not messagebox.askyesno(
-            "Force Home",
-            "Force move to HOME from the current pose, bypassing the "
-            "state-machine transition check?\n\n"
-            "Only use this when the arm is in a known-safe configuration."
-        ):
-            return
+        """Enqueue a state-machine-bypassing move to the home preset."""
         cmd = ('force_home', 'FORCE Home')
         self.cmd_queue.put(cmd)
         self._enqueue_display(cmd)
-        self._log("Force Home requested — state machine bypassed.")
+        self._log("Force Home requested — bypassing state machine. "
+                  "Ensure the arm is in a known-safe configuration.")
 
     def _on_estop(self):
         """Send an immediate emergency stop to the arm (or simulate in demo mode),
@@ -1612,19 +1604,16 @@ class VoiceControlApp:
 
     def _on_illegal_transition(self, target, current):
         """Called from the executor thread when a preset transition is blocked.
-        Schedules a modal warning popup on the main thread."""
+        Logs the details so the user can see why the move was refused."""
         allowed = sorted(_allowed_sources(target)) or ['(none)']
         radius = POSITION_RADII.get(target, 0.0)
         tol = JOINT_TOLERANCE.get(target, _DEFAULT_JOINT_TOLERANCE)
-        msg = (
-            f"Cannot move to '{target}' from '{current or 'unknown'}'.\n\n"
-            f"Allowed source states: {', '.join(allowed)}\n\n"
-            f"Override is only permitted when the TCP is within "
-            f"{radius:.0f} mm of the target pose AND every joint is within "
-            f"{tol:.0f}° of the target joint angles."
+        self._log(
+            f"Illegal transition: '{current or 'unknown'}' → '{target}'. "
+            f"Allowed sources: {', '.join(allowed)}. "
+            f"Override requires TCP within {radius:.0f} mm AND every joint "
+            f"within {tol:.0f}° of the target."
         )
-        self.root.after(
-            0, lambda: messagebox.showwarning("Illegal Transition", msg))
 
     def _on_arm_error(self, item):
         """Registered xArm error/warn callback — logs the error and warn codes."""
