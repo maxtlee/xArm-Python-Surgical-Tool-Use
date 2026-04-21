@@ -833,8 +833,10 @@ class VoiceControlApp:
         self.listen_stop_event = threading.Event()
         self.exec_stop_event = threading.Event()
         self.estop_event = threading.Event()
+        self.demo_stop_event = threading.Event()
         self.voice_thread = None
         self.exec_thread = None
+        self.demo_thread = None
         self.keyboard_active = False
         self.cmd_queue = queue.Queue()
         self.tool_var = tk.StringVar(value=next(iter(TOOL_OFFSETS)))
@@ -874,7 +876,7 @@ class VoiceControlApp:
         """Non-emergency stop: drop into state 4 to halt the current motion,
         then restore state 0 so the robot is immediately ready for new
         commands. Clears the tracked state (interrupted mid-transition) and
-        flushes the pending queue.
+        flushes the pending queue. Also signals any running demo loop.
 
         Sets estop_event *before* issuing the stop so when the blocked move
         call on the executor thread returns, it sees the flag and clears the
@@ -882,6 +884,7 @@ class VoiceControlApp:
         race as the E-stop path.)
         """
         self.estop_event.set()
+        self.demo_stop_event.set()
         if self.arm:
             self.arm.set_state(4)   # stop current motion
             self.arm.set_state(0)   # re-enable motion state for next command
@@ -891,11 +894,18 @@ class VoiceControlApp:
         self._set_state(None)
         self._set_active('—')
         self.queue_listbox.delete(0, 'end')
+        self._drain_cmd_queue()
+
+    def _drain_cmd_queue(self):
+        """Drain pending commands, calling task_done for each so that
+        cmd_queue.join() (used by the demo loop) doesn't hang."""
         while not self.cmd_queue.empty():
             try:
                 self.cmd_queue.get_nowait()
             except queue.Empty:
                 break
+            else:
+                self.cmd_queue.task_done()
 
     # --- UI construction ---------------------------------------------------
 
@@ -1019,6 +1029,10 @@ class VoiceControlApp:
         self.btn_start_kb = _btn(vrow, "Start Keyboard Control", self._on_start_keyboard,
                                  C['blue'], C['blue_dk'], state='disabled', width=22)
         self.btn_start_kb.pack(side='left', padx=(0, 8))
+
+        self.btn_start_demo = _btn(vrow, "Start Demo Loop", self._on_start_demo_loop,
+                                   C['blue'], C['blue_dk'], state='disabled', width=18)
+        self.btn_start_demo.pack(side='left', padx=(0, 8))
 
         self.btn_stop_all = _btn(vrow, "Stop All", self._on_stop_all,
                                  C['grey'], C['grey_dk'], state='disabled', width=14)
@@ -1263,6 +1277,7 @@ class VoiceControlApp:
         self.btn_disconnect.config(state='normal', bg=C['grey'])
         self.btn_start.config(state='normal', bg=C['blue'])
         self.btn_start_kb.config(state='normal', bg=C['blue'])
+        self.btn_start_demo.config(state='normal', bg=C['blue'])
         self.btn_force_home.config(state='normal', bg=C['orange'])
         self.btn_estop.config(state='normal', bg=C['red'])
         self._ensure_executor()
@@ -1300,6 +1315,7 @@ class VoiceControlApp:
         self.btn_disconnect.config(state='normal', bg=C['grey'])
         self.btn_start.config(state='normal', bg=C['blue'])
         self.btn_start_kb.config(state='normal', bg=C['blue'])
+        self.btn_start_demo.config(state='normal', bg=C['blue'])
         self.btn_force_home.config(state='normal', bg=C['orange'])
         self.btn_estop.config(state='normal', bg=C['red'])
         self._ensure_executor()
@@ -1328,6 +1344,7 @@ class VoiceControlApp:
         self.btn_disconnect.config(state='disabled', bg=C['grey_dk'])
         self.btn_start.config(state='disabled', bg=C['blue_dk'])
         self.btn_start_kb.config(state='disabled', bg=C['blue_dk'])
+        self.btn_start_demo.config(state='disabled', bg=C['blue_dk'])
         self.btn_stop_all.config(state='disabled', bg=C['grey_dk'])
         self.btn_force_home.config(state='disabled', bg=C['orange_dk'])
         self.btn_estop.config(state='disabled', bg=C['red_dk'])
@@ -1377,8 +1394,8 @@ class VoiceControlApp:
         self._log("Voice listener started.")
 
     def _on_start_keyboard(self):
-        """Bind number keys 1-4 to preset moves. Keys fire only while this
-        control is active — Stop All clears the bindings."""
+        """Bind number keys 0-4 to preset moves / demo. Keys fire only while
+        this control is active — Stop All clears the bindings."""
         if self.keyboard_active:
             return
         self._ensure_executor()
@@ -1387,10 +1404,12 @@ class VoiceControlApp:
         self.root.bind_all('<Key-2>', lambda e: self._keyboard_cmd('extend',  'Go to Extend'))
         self.root.bind_all('<Key-3>', lambda e: self._keyboard_cmd('engage',  'Go to Engage'))
         self.root.bind_all('<Key-4>', lambda e: self._keyboard_cmd('retract', 'Go to Retract'))
+        self.root.bind_all('<Key-0>', lambda e: self._on_start_demo_loop())
 
         self.btn_start_kb.config(state='disabled')
         self.btn_stop_all.config(state='normal')
-        self._log("Keyboard control started — 1=Home  2=Extend  3=Engage  4=Retract.")
+        self._log("Keyboard control started — 1=Home  2=Extend  3=Engage  "
+                  "4=Retract  0=Demo Loop.")
 
     def _keyboard_cmd(self, kind, label):
         """Enqueue a preset-move command from a keyboard press."""
@@ -1400,19 +1419,147 @@ class VoiceControlApp:
         self._log(f"Keyboard: {label}")
 
     def _on_stop_all(self):
-        """Stop the voice listener and unbind the keyboard controls."""
+        """Stop the voice listener, keyboard bindings, and demo loop."""
         self.listen_stop_event.set()
         if self.keyboard_active:
-            for k in ('<Key-1>', '<Key-2>', '<Key-3>', '<Key-4>'):
+            for k in ('<Key-0>', '<Key-1>', '<Key-2>', '<Key-3>', '<Key-4>'):
                 self.root.unbind_all(k)
             self.keyboard_active = False
             self._log("Keyboard control stopped.")
+        if self.demo_thread and self.demo_thread.is_alive():
+            self.demo_stop_event.set()
+            self._log("Demo loop stop requested.")
         self._log("Voice listener stopped.")
         self._set_mic_state("Stopped")
         enabled = 'normal' if self._session_active else 'disabled'
         self.btn_start.config(state=enabled)
         self.btn_start_kb.config(state=enabled)
+        self.btn_start_demo.config(state=enabled)
         self.btn_stop_all.config(state='disabled')
+
+    # --- Demo loop ---------------------------------------------------------
+    #
+    # Cycle 1→2→3→4 (home→extend→engage→retract), pause 6.7 s, then
+    # 4→3→2→1 and pause 16.7 s, repeating. The loop enqueues preset commands
+    # onto cmd_queue and waits for each to complete via queue.join(), so the
+    # normal executor path (state-machine gating, UI updates, estop handling)
+    # is reused for free. Stopped by the spacebar soft-stop, Stop All, the
+    # E-stop button, or disconnect — all of which set demo_stop_event.
+
+    DEMO_ORDER = ('home', 'extend', 'engage', 'retract')
+    DEMO_LABELS = {
+        'home':    'Demo → Home',
+        'extend':  'Demo → Extend',
+        'engage':  'Demo → Engage',
+        'retract': 'Demo → Retract',
+    }
+    DEMO_PAUSE_AT_RETRACT = 6.7
+    DEMO_PAUSE_AT_HOME    = 16.7
+
+    def _pick_demo_start_state(self):
+        """Return a starting preset name for the demo loop.
+
+        Prefers the currently tracked state. If unknown, probes each preset
+        in order and picks the first one whose override criteria (Cartesian
+        radius + per-joint tolerance) the arm is currently within. Returns
+        None if no preset is acceptable.
+        """
+        current = self._get_state()
+        if current in self.DEMO_ORDER:
+            return current
+        if self.arm is None:
+            return None  # can't probe without a live arm
+        for state in self.DEMO_ORDER:
+            if _can_override_transition(self.arm, state):
+                return state
+        return None
+
+    def _on_start_demo_loop(self):
+        """Start the demo cycle from the nearest acceptable state."""
+        if self.demo_thread and self.demo_thread.is_alive():
+            return
+        if not self._session_active:
+            return
+
+        start = self._pick_demo_start_state()
+        if start is None:
+            msg = ("Demo loop cannot start: no tracked state and the arm is "
+                   "not within any preset's override radius + joint "
+                   "tolerance. Move to a known preset (e.g. Force Home) "
+                   "first.")
+            self._log(msg)
+            messagebox.showwarning("Demo Loop", msg)
+            return
+
+        # If we found the start via proximity override, adopt it as the
+        # tracked state so the executor's transition checks succeed.
+        if self._get_state() != start:
+            self._set_state(start)
+            self._log(f"Demo loop: adopting '{start}' as current state "
+                      f"(within override radius).")
+
+        self.demo_stop_event.clear()
+        self.demo_thread = threading.Thread(
+            target=self._run_demo_loop,
+            args=(start,),
+            daemon=True,
+        )
+        self.demo_thread.start()
+        self.btn_start_demo.config(state='disabled')
+        self.btn_stop_all.config(state='normal')
+        self._log(f"Demo loop started at '{start}'.")
+
+    def _run_demo_loop(self, start_state):
+        """Run the 1→4→1 cycle with the two pauses. See class-level notes."""
+        try:
+            idx = self.DEMO_ORDER.index(start_state)
+            first = True
+
+            while not self.demo_stop_event.is_set():
+                # Forward leg toward retract.
+                start_i = idx if first else 0
+                for i in range(start_i + 1, len(self.DEMO_ORDER)):
+                    if not self._demo_step(self.DEMO_ORDER[i]):
+                        return
+                # Pause at retract.
+                if self.demo_stop_event.wait(self.DEMO_PAUSE_AT_RETRACT):
+                    return
+                # Reverse leg toward home.
+                for i in range(len(self.DEMO_ORDER) - 2, -1, -1):
+                    if not self._demo_step(self.DEMO_ORDER[i]):
+                        return
+                # Pause at home.
+                if self.demo_stop_event.wait(self.DEMO_PAUSE_AT_HOME):
+                    return
+                first = False
+        finally:
+            self._log("Demo loop ended.")
+            self.root.after(0, self._demo_button_reset)
+
+    def _demo_step(self, target):
+        """Push one preset move and wait for the executor to finish it.
+
+        Returns False if the demo was stopped, or the executor failed to
+        reach `target` (illegal transition, estop-interrupted, etc.).
+        """
+        if self.demo_stop_event.is_set():
+            return False
+        cmd = (target, self.DEMO_LABELS[target])
+        self.cmd_queue.put(cmd)
+        self._enqueue_display(cmd)
+        self.cmd_queue.join()   # drains on stop via _drain_cmd_queue
+        if self.demo_stop_event.is_set():
+            return False
+        if self._get_state() != target:
+            self._log(f"Demo loop: expected '{target}' but tracked state is "
+                      f"'{self._get_state() or 'unknown'}' — aborting.")
+            return False
+        return True
+
+    def _demo_button_reset(self):
+        """Restore Start Demo button availability after the thread exits."""
+        if self._session_active:
+            self.btn_start_demo.config(state='normal', bg=C['blue'])
 
     def _on_force_home(self):
         """Enqueue a state-machine-bypassing move to the home preset.
@@ -1440,6 +1587,7 @@ class VoiceControlApp:
         the tracked state instead of claiming the target it never reached.
         """
         self.estop_event.set()
+        self.demo_stop_event.set()
         if self.arm:
             self.arm.emergency_stop()
             self._log("EMERGENCY STOP sent.")
@@ -1448,11 +1596,7 @@ class VoiceControlApp:
         self._set_state(None)
         self._set_active('—')
         self.queue_listbox.delete(0, 'end')
-        while not self.cmd_queue.empty():
-            try:
-                self.cmd_queue.get_nowait()
-            except queue.Empty:
-                break
+        self._drain_cmd_queue()
 
     # --- State-machine helpers --------------------------------------------
 
