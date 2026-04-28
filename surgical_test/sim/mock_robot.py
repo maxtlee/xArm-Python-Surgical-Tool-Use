@@ -71,3 +71,7 @@ class MockRobot(RobotInterface):
     def get_hand_aperture(self) -> int:
         """Return current aperture percentage."""
         return self.aperture
+
+    def go_to_named_pose(self, name: str) -> bool:
+        print(f"[MockRobot] go_to_named_pose({name!r})")
+        return True

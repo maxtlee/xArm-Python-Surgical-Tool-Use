@@ -18,9 +18,9 @@
 
     <light pos="0.5 0.5 2" dir="0 0 -1" directional="false"/>
 
-    <!-- xArm6 placeholder stub - replace with real URDF via:
-         python -m mujoco.mjcf urdf/xarm6.urdf > urdf/xarm6.xml
-         then include it here with: <include file="../urdf/xarm6.xml"/>
+    <!-- xArm7 stub (7 DOF) - replace with real URDF via:
+         python -m mujoco.mjcf urdf/xarm7.urdf > urdf/xarm7.xml
+         then include it here with: <include file="../urdf/xarm7.xml"/>
     -->
     <body name="xarm_base" pos="0 0 0">
       <!-- Base link -->
@@ -38,23 +38,40 @@
 
           <!-- Link 3 -->
           <body name="link3" pos="0 0 0.2">
-            <joint name="joint3" type="hinge" axis="0 1 0" range="-6.28 6.28"/>
+            <joint name="joint3" type="hinge" axis="0 0 1" range="-6.28 6.28"/>
             <geom name="link3" type="capsule" size="0.03 0.1" rgba="0.6 0.6 0.6 1"/>
 
             <!-- Link 4 -->
             <body name="link4" pos="0 0 0.15">
-              <joint name="joint4" type="hinge" axis="1 0 0" range="-6.28 6.28"/>
+              <joint name="joint4" type="hinge" axis="0 1 0" range="-2.09 2.09"/>
               <geom name="link4" type="capsule" size="0.025 0.08" rgba="0.7 0.7 0.7 1"/>
 
               <!-- Link 5 -->
               <body name="link5" pos="0 0 0.1">
-                <joint name="joint5" type="hinge" axis="0 1 0" range="-2.09 2.09"/>
+                <joint name="joint5" type="hinge" axis="0 0 1" range="-6.28 6.28"/>
                 <geom name="link5" type="capsule" size="0.02 0.07" rgba="0.6 0.6 0.6 1"/>
 
-                <!-- Link 6 / End effector -->
-                <body name="link_eef" pos="0 0 0.08">
-                  <joint name="joint6" type="hinge" axis="1 0 0" range="-6.28 6.28"/>
-                  <geom name="link_eef" type="box" size="0.03 0.03 0.02" rgba="0.8 0.8 0.8 1"/>
+                <!-- Link 6 -->
+                <body name="link6" pos="0 0 0.08">
+                  <joint name="joint6" type="hinge" axis="0 1 0" range="-2.09 2.09"/>
+                  <geom name="link6" type="capsule" size="0.02 0.06" rgba="0.7 0.7 0.7 1"/>
+
+                  <!-- Link 7 / End effector with soft dexterous hand -->
+                  <body name="link_eef" pos="0 0 0.07">
+                    <joint name="joint7" type="hinge" axis="0 0 1" range="-6.28 6.28"/>
+                    <geom name="link_eef" type="box" size="0.03 0.03 0.02" rgba="0.8 0.8 0.8 1"/>
+
+                    <!-- Soft dexterous hand attached to end effector.
+                         pos is offset from link_eef origin (along z = distal direction).
+                         Tune young/poisson to match your hand's stiffness. -->
+                    <flexcomp name="foam_hand" type="box" count="4 4 2"
+                               spacing="0.022 0.022 0.022" pos="0 0 0.05"
+                               rgba="0.9 0.6 0.4 1">
+                      <edge damping="0.5"/>
+                      <elasticity young="10000" poisson="0.4" damping="0.002"/>
+                      <contact condim="3" selfcollide="none"/>
+                    </flexcomp>
+                  </body>
                 </body>
               </body>
             </body>
@@ -62,13 +79,6 @@
         </body>
       </body>
     </body>
-
-    <!-- Soft foam hand (flexcomp placeholder) -->
-    <flexcomp name="foam_hand" type="box" count="4 4 2" spacing="0.025 0.025 0.025" pos="0.3 0 0.25" rgba="0.9 0.6 0.4 1">
-      <edge damping="0.5"/>
-      <elasticity young="10000" poisson="0.4" damping="0.002"/>
-      <contact condim="3" selfcollide="none"/>
-    </flexcomp>
 
     <!-- Deformable tissue surface -->
     <flexcomp name="tissue" type="grid" count="16 16 1" spacing="0.020 0.020 0.020" pos="0.3 0 0.05" rgba="0.9 0.75 0.7 0.9">

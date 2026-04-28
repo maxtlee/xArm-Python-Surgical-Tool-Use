@@ -26,14 +26,15 @@ except (ImportError, AttributeError):
 class MuJoCoRobot(RobotInterface):
     """MuJoCo-based robot simulation with physics and soft body."""
 
-    def __init__(self, scene_path: str, vis_mode: str = 'viewer', joint_angles: Optional[List[float]] = None):
+    def __init__(self, scene_path: str, vis_mode: str = 'viewer', joint_angles: Optional[List[float]] = None,
+                 named_poses: Optional[dict] = None):
         """
         Initialize MuJoCo simulation.
 
         Args:
             scene_path: Path to scene XML file
             vis_mode: 'viewer' (interactive), 'headless' (render to video), or 'meshcat' (web viewer)
-            joint_angles: Optional list of 6 joint angles (radians) for default pose
+            joint_angles: Optional list of 7 joint angles (radians) for default pose
         """
         self.model = mujoco.MjModel.from_xml_path(scene_path)
         self.data = mujoco.MjData(self.model)
@@ -44,15 +45,21 @@ class MuJoCoRobot(RobotInterface):
         except KeyError:
             raise ValueError("Scene must contain a body named 'link_eef'")
 
+        # Number of arm DOF (xArm 7 has 7 joints)
+        self.n_arm_dof = 7
+
+        # Named joint-space poses (degrees, converted to radians on use)
+        self._named_poses = named_poses or {}
+
         # Set arm to home position
-        if joint_angles is not None and len(joint_angles) == 6:
-            self.data.qpos[:6] = joint_angles
+        if joint_angles is not None and len(joint_angles) == self.n_arm_dof:
+            self.data.qpos[:self.n_arm_dof] = joint_angles
             print(f"[MuJoCoRobot] Setting default joint angles: {joint_angles}")
         else:
-            self.data.qpos[:6] = 0.0  # All zeros for stub
+            self.data.qpos[:self.n_arm_dof] = 0.0  # All zeros for stub
 
         # Store home configuration
-        self.home_qpos = self.data.qpos[:6].copy()
+        self.home_qpos = self.data.qpos[:self.n_arm_dof].copy()
 
         mujoco.mj_forward(self.model, self.data)
 
@@ -152,8 +159,8 @@ class MuJoCoRobot(RobotInterface):
             mujoco.mj_jacBody(self.model, self.data, jacp, jacr, self.ee_id)
 
             # Damped least-squares: dq = J^T (JJ^T + λI)^-1 error
-            # Only update first 6 DOF (arm joints)
-            J = jacp[:, :6]
+            # Only update arm joints (exclude any flex DOF appended after arm)
+            J = jacp[:, :self.n_arm_dof]
             JJT = J @ J.T + lambda_damping * np.eye(3)
 
             try:
@@ -166,7 +173,7 @@ class MuJoCoRobot(RobotInterface):
             if dq_norm > max_step:
                 dq = dq * (max_step / dq_norm)
 
-            self.data.qpos[:6] += step_size * dq
+            self.data.qpos[:self.n_arm_dof] += step_size * dq
             mujoco.mj_forward(self.model, self.data)
 
         # Did not converge (but may be close enough for practical purposes)
@@ -229,9 +236,36 @@ class MuJoCoRobot(RobotInterface):
         # Always return success (best-effort movement)
         return True
 
+    def set_default_ee_position(self, x_m: float = 0.3, y_m: float = 0.0, z_m: float = 0.5) -> bool:
+        """
+        Move end-effector to a default Cartesian position using IK.
+
+        Call this after __init__ to place the arm in a meaningful start pose
+        before the viewer opens or recording begins.
+
+        Args:
+            x_m: Target X in metres (default 0.3 m forward)
+            y_m: Target Y in metres (default centred)
+            z_m: Target Z in metres (default 0.5 m above base)
+
+        Returns:
+            True if IK converged within tolerance, False otherwise
+        """
+        target_pos = np.array([x_m, y_m, z_m])
+        success = self._ik_simple(target_pos, max_iter=300)
+        mujoco.mj_forward(self.model, self.data)
+        self._step(100)
+        # Update home position to this pose so go_home() returns here
+        self.home_qpos = self.data.qpos[:self.n_arm_dof].copy()
+        pose = self.get_pose()
+        print(f"[MuJoCoRobot] Default EEF position set: "
+              f"({pose[0]:.1f}, {pose[1]:.1f}, {pose[2]:.1f}) mm "
+              f"(converged={success})")
+        return success
+
     def go_home(self) -> bool:
         """Return to home position."""
-        self.data.qpos[:6] = self.home_qpos.copy()
+        self.data.qpos[:self.n_arm_dof] = self.home_qpos.copy()
         mujoco.mj_forward(self.model, self.data)
         self._step(100)
         print("[MuJoCoRobot] Returned to home position")
@@ -239,7 +273,7 @@ class MuJoCoRobot(RobotInterface):
 
     def stop(self):
         """Stop all motion."""
-        self.data.qvel[:] = 0.0
+        self.data.qvel[:self.n_arm_dof] = 0.0
         mujoco.mj_forward(self.model, self.data)
         print("[MuJoCoRobot] STOP - all velocities zeroed")
 
@@ -252,6 +286,18 @@ class MuJoCoRobot(RobotInterface):
     def get_hand_aperture(self) -> int:
         """Get current hand aperture."""
         return self.aperture
+
+    def go_to_named_pose(self, name: str) -> bool:
+        """Move to a named joint-space pose (angles stored in degrees)."""
+        if name not in self._named_poses:
+            print(f"[MuJoCoRobot] Unknown named pose '{name}'")
+            return False
+        angles_deg = self._named_poses[name]
+        self.data.qpos[:self.n_arm_dof] = np.radians(angles_deg)
+        mujoco.mj_forward(self.model, self.data)
+        self._step(100)
+        print(f"[MuJoCoRobot] Moved to named pose '{name}'")
+        return True
 
     def get_contact_forces(self) -> List[Tuple[str, str, float]]:
         """

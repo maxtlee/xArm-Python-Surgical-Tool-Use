@@ -69,3 +69,16 @@ class RobotInterface(ABC):
             Aperture as percentage (0-100)
         """
         pass
+
+    @abstractmethod
+    def go_to_named_pose(self, name: str) -> bool:
+        """
+        Move to a named joint-space pose.
+
+        Args:
+            name: Pose name, e.g. 'pickup', 'engage', 'retract'
+
+        Returns:
+            True if successful, False if pose unknown or move failed
+        """
+        pass

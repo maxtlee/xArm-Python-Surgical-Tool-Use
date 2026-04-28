@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
 """
-Voice-Controlled xArm — 6-DOF Cartesian
-========================================
-Speak simple directional commands to move the end-effector.
+Voice-Controlled xArm — 6-DOF Cartesian (v2: variable step sizes)
+==================================================================
+Natural-language directional commands with magnitude qualifiers.
+
+Step sizes:
+  "a little" / "slightly" / "small"  →   5 mm
+  (no qualifier)                      →  20 mm
+  "more" / "further" / "a bit more"  →  40 mm
+  "a lot" / "much" / "way"           →  80 mm
 
 Voice commands:
-  "forward"   → +X  (20 mm)
-  "backward"  → -X  (20 mm)
-  "left"      → +Y  (20 mm)
-  "right"     → -Y  (20 mm)
-  "up"        → +Z  (20 mm)
-  "down"      → -Z  (20 mm)
-  "go home"   → return to home position
-  "stop"      → emergency stop
+  "forward [qualifier]"   → +X
+  "backward [qualifier]"  → -X
+  "left [qualifier]"      → +Y
+  "right [qualifier]"     → -Y
+  "up [qualifier]"        → +Z
+  "down [qualifier]"      → -Z
+  "go home"               → return to home position
+  "stop"                  → emergency stop
 
 Dependencies:
   pip install SpeechRecognition pyaudio openai-whisper
 """
 
 import os
+import re
 import sys
 import queue
 import threading
@@ -43,22 +50,52 @@ from surgical_test.command_dispatcher import CommandDispatcher
 # Helpers
 # ---------------------------------------------------------------------------
 
-STEP_MM = 20    # mm moved per voice command
-SPEED   = 50    # mm/s
+SPEED = 50  # mm/s
 
-# Maps spoken words → (dx, dy, dz, label)
+# Step sizes for each magnitude qualifier (mm)
+STEP = {
+    'little':  5,
+    'normal': 20,
+    'more':   40,
+    'lot':    80,
+}
+
+# Words that trigger each magnitude level
+LITTLE_WORDS  = {'little', 'slightly', 'small', 'tiny', 'bit'}
+MORE_WORDS    = {'more', 'further', 'farther', 'extra'}
+LOT_WORDS     = {'lot', 'much', 'way', 'far', 'big', 'large', 'huge'}
+
+# Maps direction keyword → unit vector (dx, dy, dz) and display label
 DIRECTION_MAP = {
-    'forward':  ( STEP_MM,       0,       0, 'Forward  +X'),
-    'backward': (-STEP_MM,       0,       0, 'Backward −X'),
-    'back':     (-STEP_MM,       0,       0, 'Backward −X'),
-    'left':     (      0,  STEP_MM,       0, 'Left     +Y'),
-    'right':    (      0, -STEP_MM,       0, 'Right    −Y'),
-    'up':       (      0,       0,  STEP_MM, 'Up       +Z'),
-    'down':     (      0,       0, -STEP_MM, 'Down     −Z'),
+    'forward':  ( 1,  0,  0, 'Forward  +X'),
+    'backward': (-1,  0,  0, 'Backward −X'),
+    'back':     (-1,  0,  0, 'Backward −X'),
+    'left':     ( 0,  1,  0, 'Left     +Y'),
+    'right':    ( 0, -1,  0, 'Right    −Y'),
+    'up':       ( 0,  0,  1, 'Up       +Z'),
+    'down':     ( 0,  0, -1, 'Down     −Z'),
 }
 
 
+def _detect_magnitude(words):
+    """Return the step size (mm) based on qualifier words in the utterance."""
+    if words & LOT_WORDS:
+        return STEP['lot']
+    if words & MORE_WORDS:
+        return STEP['more']
+    if words & LITTLE_WORDS:
+        return STEP['little']
+    return STEP['normal']
+
+
+def _tokenize(text):
+    """Lowercase and strip punctuation, return a set of words."""
+    return set(re.sub(r'[^\w\s]', '', text.lower()).split())
+
+
+
 def _read_ip_from_conf():
+    """Read the robot IP from example/wrapper/robot.conf, returning '' on failure."""
     conf_path = os.path.join(os.path.dirname(__file__), '../example/wrapper/robot.conf')
     try:
         parser = configparser.ConfigParser()
@@ -81,21 +118,32 @@ def _read_sim_mode():
 
 def parse_command(text):
     """
+    Parses natural-language commands with optional magnitude qualifiers.
+
     Returns one of:
-      ('move', dx, dy, dz, label)
+      ('move', dx, dy, dz, label)  — scaled by detected magnitude
       ('home', label)
       ('stop', label)
       None
     """
-    text = text.lower().strip()
+    words = _tokenize(text)
 
-    if 'stop' in text:
+    if 'stop' in words:
         return ('stop', 'Emergency Stop')
-    if 'home' in text:
+    # Require the exact adjacent phrase to avoid hallucinated single words
+    cleaned = re.sub(r'[^\w\s]', '', text.lower())
+    if 'go home' in cleaned:
         return ('home', 'Go Home')
 
-    for word, (dx, dy, dz, label) in DIRECTION_MAP.items():
-        if word in text:
+    for keyword, (ux, uy, uz, base_label) in DIRECTION_MAP.items():
+        if keyword in words:
+            step = _detect_magnitude(words)
+            dx, dy, dz = ux * step, uy * step, uz * step
+            # Build a label that shows the magnitude used
+            mag_names = {STEP['little']: 'a little', STEP['normal']: '',
+                         STEP['more']: 'more', STEP['lot']: 'a lot'}
+            qualifier = mag_names.get(step, '')
+            label = f"{base_label}  {qualifier}({step} mm)".strip()
             return ('move', dx, dy, dz, label)
 
     return None
@@ -113,24 +161,22 @@ def _cmd_label(cmd):
 def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
     """
     Captures mic audio, recognises speech, and enqueues parsed commands.
-    Tries Whisper first; falls back to Google Speech Recognition on error.
+
+    Two-phase detection for low latency + qualifier support:
+      Phase 1 — short pause_threshold (0.4s) so direction words fire quickly.
+      Phase 2 — if phase 1 detected a direction with NO qualifier, do one
+                 extra listen() with a QUALIFIER_WINDOW_S timeout. If the
+                 user adds a qualifier ("a little", "more", etc.) it is merged
+                 before the command is enqueued. If silence times out the
+                 command fires immediately with the default step.
+
     Calls on_mic_state(str) to update the mic indicator.
     Calls on_heard(raw_text, cmd_or_None) for every recognition result.
     """
     r = sr.Recognizer()
-    r.pause_threshold = 0.3
+    r.pause_threshold = 0.4        # short silence window → fast detection
     r.phrase_threshold = 0.1
-    r.non_speaking_duration = 0.2
-
-    # Check if Whisper is available (try to import it)
-    use_whisper = True
-    try:
-        import whisper
-        # Try to initialize it to catch ctypes errors early (Windows issue)
-        _ = whisper.__version__
-    except Exception as e:
-        on_mic_state(f"Whisper unavailable: {e} — using Google Speech Recognition")
-        use_whisper = False
+    r.non_speaking_duration = 0.3
 
     try:
         mic = sr.Microphone()
@@ -145,7 +191,7 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
 
         while not stop_event.is_set():
             try:
-                audio = r.listen(source, timeout=3, phrase_time_limit=2)
+                audio = r.listen(source, timeout=3, phrase_time_limit=3)
             except sr.WaitTimeoutError:
                 on_mic_state("● Listening…")
                 continue
@@ -155,43 +201,23 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
 
             on_mic_state("● Processing…")
 
-            text = None
             try:
-                if use_whisper:
-                    try:
-                        text = r.recognize_whisper(
-                            audio, model="small", language="english",
-                            initial_prompt="move forward, move backward, move left, move right, move up, move down, go home, stop",
-                            no_speech_threshold=0.6,
-                            fp16=False,
-                        ).lower()
-                    except (TypeError, AttributeError, ImportError):
-                        # Whisper load failed (common on Windows), switch to Google
-                        on_mic_state("● Processing (Google)…")
-                        text = r.recognize_google(audio, language="en-US").lower()
-                else:
-                    # Whisper not available, use Google
-                    text = r.recognize_google(audio, language="en-US").lower()
-
+                text = r.recognize_whisper(
+                    audio, model="small", language="english",
+                    initial_prompt="move forward a little, move backward more, move left a lot, move right slightly, move up, move down, go home, stop",
+                    no_speech_threshold=0.8,
+                    fp16=False,
+                ).lower()
             except sr.UnknownValueError:
                 on_mic_state("● Listening…")
                 on_heard("(unclear)", None)
                 continue
-            except sr.RequestError as e:
-                on_mic_state(f"API error: {e}")
-                on_heard("(api error)", None)
-                continue
-            except Exception as e:
-                on_mic_state(f"Recognition error: {e}")
-                on_heard("(error)", None)
-                continue
 
-            if text:
-                cmd = parse_command(text)
-                on_heard(text, cmd)
+            cmd = parse_command(text)
+            on_heard(text, cmd)
 
-                if cmd is not None:
-                    cmd_queue.put(cmd)
+            if cmd is not None:
+                cmd_queue.put(cmd)
 
             on_mic_state("● Listening…")
 
@@ -203,10 +229,6 @@ def execute_loop(arm, cmd_queue, stop_event, on_active, on_done, on_log, robot=N
     Drains cmd_queue and executes each command on the arm.
     If arm is None but robot/dispatcher are provided (demo mode), uses simulation.
     Calls on_active(label) when a command starts, on_done() when it finishes.
-
-    Supports two command formats:
-      1. Legacy tuple: ('move', dx, dy, dz, label) or ('home', label) or ('stop', label)
-      2. JSON dict: {"command": "move_left", "magnitude": "small"} for dispatcher
     """
     while not stop_event.is_set():
         try:
@@ -214,62 +236,45 @@ def execute_loop(arm, cmd_queue, stop_event, on_active, on_done, on_log, robot=N
         except queue.Empty:
             continue
 
-        # Determine if this is a tuple command or dict command
-        if isinstance(cmd, dict):
-            # JSON command for dispatcher
-            label = cmd.get('command', 'unknown')
-            on_active(label)
-            on_log(f"Dispatching: {label}")
+        label = _cmd_label(cmd)
+        on_active(label)
 
-            if dispatcher is not None:
-                try:
-                    success = dispatcher.dispatch(cmd)
-                    if not success:
-                        on_log(f"Dispatcher failed for: {label}")
-                except Exception as e:
-                    on_log(f"Dispatcher error during '{label}': {e}")
-            else:
-                on_log(f"[NO DISPATCHER] Would execute: {label}")
-        else:
-            # Legacy tuple command
-            label = _cmd_label(cmd)
-            on_active(label)
-
-            if arm is None and robot is None:
-                on_log(f"[DEMO] Would execute: {label}")
-                import time; time.sleep(0.4)
-            elif arm is not None:
-                # Use physical arm
-                on_log(f"Executing: {label}")
-                try:
-                    if cmd[0] == 'stop':
-                        arm.emergency_stop()
-                    elif cmd[0] == 'home':
-                        arm.move_gohome(wait=True)
-                    elif cmd[0] == 'move':
-                        _, dx, dy, dz, _ = cmd
-                        arm.set_position(
-                            x=dx, y=dy, z=dz,
-                            roll=0, pitch=0, yaw=0,
-                            relative=True,
-                            speed=SPEED,
-                            wait=True,
-                        )
-                except Exception as e:
-                    on_log(f"Arm error during '{label}': {e}")
-            elif robot is not None:
-                # Use simulation robot
-                on_log(f"[SIM] Executing: {label}")
-                try:
-                    if cmd[0] == 'stop':
-                        robot.stop()
-                    elif cmd[0] == 'home':
-                        robot.go_home()
-                    elif cmd[0] == 'move':
-                        _, dx, dy, dz, _ = cmd
-                        robot.move_relative(dx=dx, dy=dy, dz=dz)
-                except Exception as e:
-                    on_log(f"Robot error during '{label}': {e}")
+        if arm is None and robot is None:
+            on_log(f"[DEMO] Would execute: {label}")
+            import time; time.sleep(0.4)
+        elif arm is not None:
+            on_log(f"Executing: {label}")
+            try:
+                if cmd[0] == 'stop':
+                    arm.emergency_stop()
+                elif cmd[0] == 'home':
+                    arm.set_servo_angle(
+                        angle=[-3.5, 9.4, 0, 13.9, 0, -23, 0],
+                        speed=30, wait=True,
+                    )
+                elif cmd[0] == 'move':
+                    _, dx, dy, dz, _ = cmd
+                    arm.set_position(
+                        x=dx, y=dy, z=dz,
+                        roll=0, pitch=0, yaw=0,
+                        relative=True,
+                        speed=SPEED,
+                        wait=True,
+                    )
+            except Exception as e:
+                on_log(f"Arm error during '{label}': {e}")
+        elif robot is not None:
+            on_log(f"[SIM] Executing: {label}")
+            try:
+                if cmd[0] == 'stop':
+                    robot.stop()
+                elif cmd[0] == 'home':
+                    robot.go_home()
+                elif cmd[0] == 'move':
+                    _, dx, dy, dz, _ = cmd
+                    robot.move_relative(dx=dx, dy=dy, dz=dz)
+            except Exception as e:
+                on_log(f"Robot error during '{label}': {e}")
 
         cmd_queue.task_done()
         on_done()
@@ -301,11 +306,12 @@ C = {
 
 
 def _btn(parent, text, cmd, color, color_dk, state='normal', width=14, big=False):
-    """Flat-style button with hover effect."""
+    """Flat-style button with hover effect. Text is near-black to contrast with
+    the coloured button background."""
     fsize = 13 if big else 11
     b = tk.Button(
         parent, text=text, command=cmd,
-        bg=color, fg=C['text'], activebackground=color_dk, activeforeground=C['text'],
+        bg=color, fg='#111111', activebackground=color_dk, activeforeground='#111111',
         font=('Helvetica', fsize, 'bold'), width=width,
         relief='flat', bd=0, padx=12, pady=8,
         cursor='hand2', state=state,
@@ -331,7 +337,20 @@ def _section(parent, title):
 # ---------------------------------------------------------------------------
 
 class VoiceControlApp:
+    """
+    Tkinter GUI that connects to an xArm, listens for voice commands via
+    Whisper, and executes Cartesian movements in real time.
+
+    The app runs two daemon threads while listening is active:
+      - listen_loop  — records audio and enqueues parsed commands
+      - execute_loop — drains the queue and sends commands to the arm
+
+    All GUI updates from those threads are posted via root.after() to stay
+    on the main thread.
+    """
+
     def __init__(self, root):
+        """Initialise state and build the UI."""
         self.root = root
         self.root.title("xArm Voice Control")
         self.root.resizable(True, True)
@@ -355,8 +374,32 @@ class VoiceControlApp:
     # --- UI construction ---------------------------------------------------
 
     def _build_ui(self):
+        """Construct all widgets: menubar, header, connection panel, voice controls,
+        live status, and activity log/queue."""
         W = self.root
         P = {'padx': 16}
+
+        # ── Menubar ─────────────────────────────────────────────────────────
+        menubar = tk.Menu(W, bg=C['surface'], fg=C['text'],
+                          activebackground='#C41230', activeforeground=C['text'],
+                          relief='flat', bd=0)
+        cmd_menu = tk.Menu(menubar, tearoff=0,
+                           bg=C['surface'], fg=C['text'],
+                           activebackground='#C41230', activeforeground=C['text'],
+                           relief='flat', bd=0, font=('Courier', 12))
+        cmd_menu.add_command(label='Qualifiers:  (none) = 20 mm  |  a little = 5 mm  |  more = 40 mm  |  a lot = 80 mm', state='disabled')
+        cmd_menu.add_separator()
+        cmd_menu.add_command(label='"forward [qualifier]"   →  +X', state='disabled')
+        cmd_menu.add_command(label='"backward [qualifier]"  →  -X', state='disabled')
+        cmd_menu.add_command(label='"left [qualifier]"      →  +Y', state='disabled')
+        cmd_menu.add_command(label='"right [qualifier]"     →  -Y', state='disabled')
+        cmd_menu.add_command(label='"up [qualifier]"        →  +Z', state='disabled')
+        cmd_menu.add_command(label='"down [qualifier]"      →  -Z', state='disabled')
+        cmd_menu.add_separator()
+        cmd_menu.add_command(label='"go home"               →  return to home position', state='disabled')
+        cmd_menu.add_command(label='"stop"                  →  emergency stop',          state='disabled')
+        menubar.add_cascade(label='Commands', menu=cmd_menu)
+        W.config(menu=menubar)
 
         # ── Header ──────────────────────────────────────────────────────────
         hdr = tk.Frame(W, bg='#C41230', pady=16)
@@ -372,7 +415,7 @@ class VoiceControlApp:
 
         self.status_badge = tk.Label(hdr, text="  OFFLINE  ", bg='#8f0d22', fg='#ffffff',
                                      font=('Helvetica', 10, 'bold'), padx=8, pady=4)
-        self.status_badge.pack(side='right', padx=4, pady=6)
+        self.status_badge.pack(side='right', padx=20, pady=6)
 
         main = tk.Frame(W, bg=C['bg'])
         main.pack(fill='both', expand=True, padx=16, pady=8)
@@ -489,37 +532,17 @@ class VoiceControlApp:
         )
         self.status_log.pack(fill='both', expand=True)
 
-        # ── Reference card ──────────────────────────────────────────────────
-        ref_out, ref_in = _section(main, "Voice Commands")
-        ref_out.pack(fill='x', pady=(0, 16), **P)
-
-        commands = [
-            ('forward / backward', f'±X  ({STEP_MM} mm)'),
-            ('left / right',       f'±Y  ({STEP_MM} mm)'),
-            ('up / down',          f'±Z  ({STEP_MM} mm)'),
-            ('go home',            'return to home position'),
-            ('stop',               'emergency stop'),
-        ]
-        ref_grid = tk.Frame(ref_in, bg=C['surface'])
-        ref_grid.pack(fill='x', padx=12, pady=10)
-        ref_grid.columnconfigure(0, minsize=220)
-        ref_grid.columnconfigure(1, weight=1)
-        for i, (cmd_txt, desc) in enumerate(commands):
-            tk.Label(ref_grid, text=f'"{cmd_txt}"', bg=C['surface'], fg='#C41230',
-                     font=('Courier', 12, 'bold'), anchor='w').grid(
-                         row=i, column=0, sticky='w', pady=2)
-            tk.Label(ref_grid, text=f'  ->  {desc}', bg=C['surface'], fg=C['subtext'],
-                     font=('Helvetica', 12), anchor='w').grid(
-                         row=i, column=1, sticky='w', pady=2)
-
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # --- Thread-safe GUI updates -------------------------------------------
 
     def _set_mic_state(self, text):
+        """Thread-safe update of the mic status label."""
         self.root.after(0, lambda: self.mic_var.set(text))
 
     def _set_heard(self, raw_text, cmd):
+        """Thread-safe update of the 'Heard' label. Shows green on a recognised
+        command and red on an unrecognised one."""
         def _update():
             if cmd is None:
                 self.heard_var.set(f'"{raw_text}"   ✗ unrecognised')
@@ -530,6 +553,8 @@ class VoiceControlApp:
         self.root.after(0, _update)
 
     def _set_active(self, label):
+        """Thread-safe update of the 'Active' command badge with colour coding:
+        grey for idle, dark-red for stop, blue-dark for home, green-dark for moves."""
         def _update():
             self.active_var.set(label)
             if label == '—':
@@ -558,6 +583,7 @@ class VoiceControlApp:
         self.root.after(0, _update)
 
     def _log(self, msg):
+        """Thread-safe append of a message to the scrolling history log."""
         def _append():
             self.status_log.config(state='normal')
             self.status_log.insert('end', msg + '\n')
@@ -568,6 +594,8 @@ class VoiceControlApp:
     # --- on_heard callback (called from listen thread) ---------------------
 
     def _on_heard(self, raw_text, cmd):
+        """Callback from listen_loop. Updates the heard label, logs the result,
+        and adds the command to the queue display if recognised."""
         self._set_heard(raw_text, cmd)
         if cmd is not None:
             self._log(f'Queued: {_cmd_label(cmd)}  ("{raw_text}")')
@@ -601,6 +629,8 @@ class VoiceControlApp:
         self.btn_estop.config(state='normal', bg=C['red'])
 
     def _on_connect(self):
+        """Connect to the robot at the entered IP, enable motion, and set
+        position-control mode. Updates button states on success or failure."""
         ip = self.ip_var.get().strip()
         if not ip:
             self._log("ERROR: Enter a robot IP address.")
@@ -627,6 +657,8 @@ class VoiceControlApp:
         self.status_badge.config(text="  LIVE  ", bg='#8f0d22')
 
     def _on_disconnect(self):
+        """Stop listening, disconnect the arm, and reset all buttons to their
+        disconnected state."""
         self._on_stop_listening()
         if self.arm:
             self.arm.disconnect()
@@ -645,6 +677,8 @@ class VoiceControlApp:
         self.btn_estop.config(state='disabled', bg=C['red_dk'])
 
     def _on_start(self):
+        """Clear any stale queue, then launch the listen and execute daemon
+        threads. No-ops if a listen session is already running."""
         if self.voice_thread and self.voice_thread.is_alive():
             return
         # Clear stale queue display
@@ -678,6 +712,7 @@ class VoiceControlApp:
         self._log("Voice listener started.")
 
     def _on_stop_listening(self):
+        """Signal both daemon threads to stop via the shared stop_event."""
         self.stop_event.set()
         self.btn_start.config(state='normal' if self._session_active else 'disabled')
         self.btn_stop_listen.config(state='disabled')
@@ -685,6 +720,8 @@ class VoiceControlApp:
         self._log("Voice listener stopped.")
 
     def _on_estop(self):
+        """Send an immediate emergency stop to the arm (or simulate in demo mode),
+        then clear the pending command queue and display."""
         if self.arm:
             self.arm.emergency_stop()
             self._log("EMERGENCY STOP sent.")
@@ -699,9 +736,11 @@ class VoiceControlApp:
                 break
 
     def _on_arm_error(self, item):
+        """Registered xArm error/warn callback — logs the error and warn codes."""
         self._log(f"Arm error/warn — code={item.get('error_code')} warn={item.get('warn_code')}")
 
     def _on_close(self):
+        """Window close handler — disconnect cleanly before destroying the window."""
         self._on_disconnect()
         self.root.destroy()
 

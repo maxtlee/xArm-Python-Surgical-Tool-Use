@@ -35,6 +35,15 @@ def get_robot(config_path: str = 'surgical.conf') -> RobotInterface:
 
     mode = config['sim'].get('mode', 'mock').lower()
 
+    # Load named joint-space poses from [named_poses] section
+    named_poses = {}
+    if 'named_poses' in config:
+        for pose_name, angles_str in config['named_poses'].items():
+            try:
+                named_poses[pose_name] = [float(x.strip()) for x in angles_str.split(',')]
+            except ValueError:
+                pass
+
     if mode == 'mock':
         # Lazy import - no external dependencies needed
         from .mock_robot import MockRobot
@@ -59,8 +68,24 @@ def get_robot(config_path: str = 'surgical.conf') -> RobotInterface:
     elif mode == 'mujoco':
         # Lazy import - only import mujoco when needed
         from .mujoco_robot import MuJoCoRobot
+        import os
 
         scene_path = config['sim'].get('scene', 'surgical_test/sim/scene.xml')
+
+        # Resolve scene_path: try relative to project root, then to module location
+        if not os.path.isabs(scene_path) and not os.path.exists(scene_path):
+            # Try relative to project root (parent of surgical_test)
+            module_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(os.path.dirname(module_dir))
+            alt_path = os.path.join(project_root, scene_path)
+            if os.path.exists(alt_path):
+                scene_path = alt_path
+            else:
+                # Try relative to module directory
+                alt_path = os.path.join(module_dir, 'scene.xml')
+                if os.path.exists(alt_path):
+                    scene_path = alt_path
+
         vis_mode = config['sim'].get('vis_mode', 'viewer')
 
         # Parse default joint angles from config
@@ -70,12 +95,13 @@ def get_robot(config_path: str = 'surgical.conf') -> RobotInterface:
                 angles_str = config['pose'].get('joint_angles', '')
                 if angles_str.strip():
                     joint_angles = [float(x.strip()) for x in angles_str.split(',')]
-                    if len(joint_angles) != 6:
-                        raise ValueError(f"Expected 6 joint angles, got {len(joint_angles)}")
+                    if len(joint_angles) != 7:
+                        raise ValueError(f"Expected 7 joint angles, got {len(joint_angles)}")
             except (ValueError, KeyError):
                 joint_angles = None
 
-        return MuJoCoRobot(scene_path=scene_path, vis_mode=vis_mode, joint_angles=joint_angles)
+        return MuJoCoRobot(scene_path=scene_path, vis_mode=vis_mode, joint_angles=joint_angles,
+                           named_poses=named_poses)
 
     elif mode == 'real':
         # Lazy import - only import xarm when needed
@@ -111,7 +137,8 @@ def get_robot(config_path: str = 'surgical.conf') -> RobotInterface:
         return RealRobot(
             arm_config=arm_config,
             workspace_config=workspace_config,
-            hand_config=hand_config
+            hand_config=hand_config,
+            named_poses=named_poses,
         )
 
     else:

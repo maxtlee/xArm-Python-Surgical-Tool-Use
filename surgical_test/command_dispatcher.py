@@ -130,6 +130,13 @@ class CommandDispatcher:
         elif command == 'go_home':
             return self.robot.go_home()
 
+        elif command in ('go_to_named_pose', 'named_pose'):
+            pose_name = cmd.get('pose', '')
+            if not pose_name:
+                print(f"[CommandDispatcher] WARNING: go_to_named_pose missing 'pose' key")
+                return False
+            return self.robot.go_to_named_pose(pose_name)
+
         # Unknown command
         else:
             print(f"[CommandDispatcher] WARNING: Unknown command '{command}'")

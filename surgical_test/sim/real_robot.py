@@ -22,7 +22,8 @@ class RealRobot(RobotInterface):
         self,
         arm_config: Dict,
         workspace_config: Dict,
-        hand_config: Optional[Dict] = None
+        hand_config: Optional[Dict] = None,
+        named_poses: Optional[Dict] = None,
     ):
         """
         Initialize real robot connection.
@@ -47,6 +48,9 @@ class RealRobot(RobotInterface):
         self.arm.clean_error()
 
         print("[RealRobot] xArm initialized")
+
+        # Named joint-space poses (degrees)
+        self._named_poses = named_poses or {}
 
         # Initialize serial connection for foam hand (optional)
         self.ser = None
@@ -171,6 +175,19 @@ class RealRobot(RobotInterface):
     def get_hand_aperture(self) -> int:
         """Get current hand aperture."""
         return self.aperture
+
+    def go_to_named_pose(self, name: str) -> bool:
+        """Move to a named joint-space pose."""
+        if name not in self._named_poses:
+            print(f"[RealRobot] Unknown named pose '{name}'")
+            return False
+        angles_deg = self._named_poses[name]
+        code = self.arm.set_servo_angle(angle=angles_deg, speed=30, wait=True)
+        if code != 0:
+            print(f"[RealRobot] Named pose '{name}' failed with code={code}")
+            return False
+        print(f"[RealRobot] Moved to named pose '{name}'")
+        return True
 
     def get_contact_forces(self) -> List:
         """Contact forces not available on real hardware."""

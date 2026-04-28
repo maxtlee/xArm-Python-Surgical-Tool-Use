@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+# Github usage
+
+Claude MAY NOT use 'git add', 'git commit', 'git push.' Only Read-Only git operations are allowed.
+
 ## Overview
 
 This is the **xArm Python SDK** — a Python library for controlling UFACTORY robotic arms (xArm 5/6/7, 850, Lite6) over TCP/IP or serial. The repo name "Surgical-Tool-Use" reflects a custom fork for surgical robotics use cases.
