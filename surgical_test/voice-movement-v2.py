@@ -31,9 +31,8 @@ import queue
 import threading
 import tkinter as tk
 from tkinter import scrolledtext, font as tkfont
-import configparser
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
 try:
     import speech_recognition as sr
@@ -42,8 +41,13 @@ except ImportError:
     sys.exit(1)
 
 from xarm.wrapper import XArmAPI
-from surgical_test.sim import get_robot
-from surgical_test.command_dispatcher import CommandDispatcher
+
+try:
+    from surgical_test.sim import get_robot
+    from surgical_test.command_dispatcher import CommandDispatcher
+    _SIMULATION_AVAILABLE = True
+except ImportError:
+    _SIMULATION_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +102,8 @@ def _read_ip_from_conf():
     """Read the robot IP from example/wrapper/robot.conf, returning '' on failure."""
     conf_path = os.path.join(os.path.dirname(__file__), '../example/wrapper/robot.conf')
     try:
-        parser = configparser.ConfigParser()
+        from configparser import ConfigParser
+        parser = ConfigParser()
         parser.read(conf_path)
         return parser.get('xArm', 'ip')
     except Exception:
@@ -109,7 +114,8 @@ def _read_sim_mode():
     """Read simulation mode from surgical.conf."""
     conf_path = 'surgical.conf'
     try:
-        parser = configparser.ConfigParser()
+        from configparser import ConfigParser
+        parser = ConfigParser()
         parser.read(conf_path)
         return parser.get('sim', 'mode', fallback='mock')
     except Exception:
@@ -226,8 +232,9 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
 
 def execute_loop(arm, cmd_queue, stop_event, on_active, on_done, on_log, robot=None, dispatcher=None):
     """
-    Drains cmd_queue and executes each command on the arm.
+    Drains cmd_queue and executes each command on the arm or simulation robot.
     If arm is None but robot/dispatcher are provided (demo mode), uses simulation.
+    If arm is None (demo mode), commands are logged but not sent.
     Calls on_active(label) when a command starts, on_done() when it finishes.
     """
     while not stop_event.is_set():
@@ -239,10 +246,7 @@ def execute_loop(arm, cmd_queue, stop_event, on_active, on_done, on_log, robot=N
         label = _cmd_label(cmd)
         on_active(label)
 
-        if arm is None and robot is None:
-            on_log(f"[DEMO] Would execute: {label}")
-            import time; time.sleep(0.4)
-        elif arm is not None:
+        if arm is not None:
             on_log(f"Executing: {label}")
             try:
                 if cmd[0] == 'stop':
@@ -275,6 +279,9 @@ def execute_loop(arm, cmd_queue, stop_event, on_active, on_done, on_log, robot=N
                     robot.move_relative(dx=dx, dy=dy, dz=dz)
             except Exception as e:
                 on_log(f"Robot error during '{label}': {e}")
+        else:
+            on_log(f"[DEMO] Would execute: {label}")
+            import time; time.sleep(0.4)
 
         cmd_queue.task_done()
         on_done()
@@ -606,22 +613,26 @@ class VoiceControlApp:
     # --- Button callbacks --------------------------------------------------
 
     def _on_demo(self):
-        """Start in demo mode — uses simulation robot based on surgical.conf."""
+        """Start in demo mode — uses simulation robot based on surgical.conf if available."""
         self.arm = None
         self._session_active = True
 
-        # Initialize simulation robot and dispatcher
-        try:
-            self.robot = get_robot('../surgical.conf')
-            self.dispatcher = CommandDispatcher(robot=self.robot)
-            self._log(f"Demo mode — using {self.sim_mode} simulation, no physical robot.")
-        except Exception as e:
-            self._log(f"Failed to initialize simulation: {e}")
-            self.robot = None
-            self.dispatcher = None
-            self._log("Demo mode — commands will be logged only.")
-
-        self.status_badge.config(text="  DEMO  ", bg='#5a5a5a')
+        # Initialize simulation robot and dispatcher if available
+        if _SIMULATION_AVAILABLE:
+            try:
+                self.robot = get_robot('../surgical.conf')
+                self.dispatcher = CommandDispatcher(robot=self.robot)
+                self._log(f"Demo mode — using {self.sim_mode} simulation, no physical robot.")
+                self.status_badge.config(text="  SIM  ", bg='#5a5a5a')
+            except Exception as e:
+                self._log(f"Failed to initialize simulation: {e}")
+                self.robot = None
+                self.dispatcher = None
+                self._log("Demo mode — commands will be logged only.")
+                self.status_badge.config(text="  DEMO  ", bg='#5a5a5a')
+        else:
+            self._log("Demo mode — commands will be simulated, no robot connected.")
+            self.status_badge.config(text="  DEMO  ", bg='#5a5a5a')
         self.btn_connect.config(state='disabled')
         self.btn_demo.config(state='disabled')
         self.btn_disconnect.config(state='normal', bg=C['grey'])

@@ -4,27 +4,41 @@ Voice-Controlled xArm — 6-DOF Cartesian
 ========================================
 Speak simple directional commands to move the end-effector.
 
+Step sizes:
+  "a little" / "slightly" / "small"  →   5 mm
+  (no qualifier)                      →  20 mm
+  "more" / "further" / "a bit more"  →  40 mm
+  "a lot" / "much" / "way"           →  80 mm
+
 Voice commands:
-  "forward"   → +X  (20 mm)
-  "backward"  → -X  (20 mm)
-  "left"      → +Y  (20 mm)
-  "right"     → -Y  (20 mm)
-  "up"        → +Z  (20 mm)
-  "down"      → -Z  (20 mm)
-  "go home"   → return to home position
-  "stop"      → emergency stop
+  "forward [qualifier]"   → +X
+  "backward [qualifier]"  → -X
+  "left [qualifier]"      → +Y
+  "right [qualifier]"     → -Y
+  "up [qualifier]"        → +Z
+  "down [qualifier]"      → -Z
+  "go home"               → return to home position
+  "pickup"                → move to pickup position
+  "engage"                → move to engage position
+  "retract"               → move to retract position
+  "stop"                  → emergency stop
+  "open"                  → open DexHand gripper
+  "close"                 → close DexHand gripper
 
 Dependencies:
-  pip install SpeechRecognition pyaudio openai-whisper
+  pip install SpeechRecognition pyaudio openai-whisper dynamixel-sdk
 """
 
+import io
 import os
+import re
 import sys
 import queue
 import threading
 import tkinter as tk
 from tkinter import scrolledtext, font as tkfont
 import configparser
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -35,30 +49,206 @@ except ImportError:
     sys.exit(1)
 
 from xarm.wrapper import XArmAPI
-from surgical_test.sim import get_robot
-from surgical_test.command_dispatcher import CommandDispatcher
+
+try:
+    from surgical_test.sim import get_robot
+    from surgical_test.command_dispatcher import CommandDispatcher
+    _SIMULATION_AVAILABLE = True
+except ImportError:
+    _SIMULATION_AVAILABLE = False
+
+try:
+    from dynamixel_sdk import PortHandler, PacketHandler
+    _DYNAMIXEL_AVAILABLE = True
+except ImportError:
+    _DYNAMIXEL_AVAILABLE = False
+
+import yaml
+
+
+# ---------------------------------------------------------------------------
+# Gripper (DexHand via Dynamixel)
+# ---------------------------------------------------------------------------
+
+_POSES_FILE = os.path.join(os.path.dirname(__file__), "gripper_poses.yaml")
+
+# Motor name → Dynamixel ID (matches NIBIB1.py Config.MOTOR_NAMES order)
+_MOTOR_IDS = {
+    "PinkyFlexion":   0,
+    "RingFlexion":    1,
+    "MiddleFlexion":  2,
+    "IndexFlexion":   3,
+    "ThumbAdduction": 4,
+    "ThumbFlexion":   5,
+}
+
+_TICKS_PER_REV = 4096   # matches NIBIB1.py Config.TICKS_PER_REV
+
+_ADDR_TORQUE_ENABLE    = 64
+_ADDR_PROFILE_VELOCITY = 112
+_ADDR_GOAL_POSITION    = 116
+_ADDR_PRESENT_POSITION = 132
+
+
+def _degrees_to_ticks(degrees):
+    """Identical to NIBIB1.py Utility.degrees_to_ticks()."""
+    return int(degrees * _TICKS_PER_REV / 360)
+
+
+def _ticks_to_degrees(ticks):
+    """Identical to NIBIB1.py Utility.ticks_to_degrees()."""
+    return float(ticks * 360 / _TICKS_PER_REV)
+
+
+def _load_gripper_config(path=_POSES_FILE):
+    """Load gripper_poses.yaml and return (config_dict, poses_dict)."""
+    with open(path, "r") as f:
+        data = yaml.safe_load(f)
+    return data.get("config", {}), data.get("poses", {})
+
+
+def _pose_to_tick_list(pose_data):
+    """Convert a pose's motor_degrees mapping to an ordered tick list [ID0..ID5].
+
+    Matches NIBIB1.py HandDemoWindow.run_sequence():
+      ticks = [Utility.degrees_to_ticks(val) for val in pose_values]
+    """
+    motor_degrees = pose_data.get("motor_degrees", {})
+    return [
+        _degrees_to_ticks(float(motor_degrees.get(name, 0.0)))
+        for name, _ in sorted(_MOTOR_IDS.items(), key=lambda kv: kv[1])
+    ]
+
+
+class GripperController:
+    """Controls the DexHand via Dynamixel.
+
+    Mirrors NIBIB1.py DynamixelController: degrees in YAML → ticks at runtime,
+    home offsets recorded at init, per-motor profile velocity.
+    """
+
+    def __init__(self, poses_file=_POSES_FILE):
+        if not _DYNAMIXEL_AVAILABLE:
+            raise RuntimeError("dynamixel_sdk not installed — run: pip install dynamixel-sdk")
+
+        cfg, poses = _load_gripper_config(poses_file)
+
+        port      = cfg.get("port", "/dev/ttyACM0")
+        baud      = int(cfg.get("baud_rate", 2_000_000))
+        protocol  = float(cfg.get("protocol_version", 2.0))
+        prof_vel  = int(cfg.get("profile_velocity", 100))
+
+        self._open_ticks  = _pose_to_tick_list(poses.get("open",  {}))
+        self._close_ticks = _pose_to_tick_list(poses.get("close", {}))
+
+        self._ph = PortHandler(port)
+        if not self._ph.openPort():
+            raise RuntimeError(f"Failed to open gripper port {port}")
+        if not self._ph.setBaudRate(baud):
+            raise RuntimeError("Failed to set gripper baud rate")
+        self._pkt = PacketHandler(protocol)
+
+        # Enable torque and set profile velocity per motor individually,
+        # matching NIBIB1.py DynamixelController.__init__()
+        for dxl_id in _MOTOR_IDS.values():
+            self._pkt.write1ByteTxRx(self._ph, dxl_id, _ADDR_TORQUE_ENABLE, 1)
+            self._pkt.write4ByteTxRx(self._ph, dxl_id, _ADDR_PROFILE_VELOCITY, prof_vel)
+
+        # Record present position of each motor as home offset,
+        # matching NIBIB1.py HandPoseControllerWindow.__init__():
+        #   self.home_offsets = self.ctrl.get_all_positions()
+        self.home_offsets = self.get_all_positions()
+
+    # -- Position readback (mirrors DynamixelController.get_position) -------
+
+    def get_position(self, dxl_id):
+        """Read present position in ticks, handling two's-complement rollover."""
+        present, _, _ = self._pkt.read4ByteTxRx(
+            self._ph, dxl_id, _ADDR_PRESENT_POSITION
+        )
+        return present - 0x100000000 if present & 0x80000000 else present
+
+    def get_all_positions(self):
+        return [self.get_position(dxl_id) for _, dxl_id in
+                sorted(_MOTOR_IDS.items(), key=lambda kv: kv[1])]
+
+    # -- Position commands (mirrors DynamixelController.set_position) --------
+
+    def _set_positions(self, tick_list):
+        """Send absolute tick positions to each motor individually,
+        matching NIBIB1.py DynamixelController.set_all_positions()."""
+        for _, dxl_id in sorted(_MOTOR_IDS.items(), key=lambda kv: kv[1]):
+            ticks = tick_list[dxl_id]
+            self._pkt.write4ByteTxRx(
+                self._ph, dxl_id, _ADDR_GOAL_POSITION, ticks & 0xFFFFFFFF
+            )
+
+    def open(self):
+        self._set_positions(self._open_ticks)
+
+    def close(self):
+        self._set_positions(self._close_ticks)
+
+    def disconnect(self):
+        """Disable torque and close port, matching DynamixelController.close()."""
+        for dxl_id in _MOTOR_IDS.values():
+            self._pkt.write1ByteTxRx(self._ph, dxl_id, _ADDR_TORQUE_ENABLE, 0)
+        self._ph.closePort()
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-STEP_MM = 20    # mm moved per voice command
-SPEED   = 50    # mm/s
+SPEED = 50  # mm/s
 
-# Maps spoken words → (dx, dy, dz, label)
+# Hardcoded joint-angle positions [j1..j7] (degrees).  Edit these to match
+# your robot's actual setpoints.
+JOINT_POSITIONS = {
+    # 'home': [-86.9, 81.1, 132.1, 53, -71.4, 102.1, 47.8],
+    # 'home':    [-9.3,  2.8,  10.4, 24.5,  92.9, 1.7,  -90.4],
+    # 'pickup':  [-9.3,  2.8,  10.4, 24.5,  92.9, 163.6,  -90.4],  
+    # 'home':    [-95.4,  93,  100.5, 19.9,  -87.1, 92.7,  2.9],
+    # 'pickup':    [-95.4,  93,  100.5, 19.9,  -266.4, 92.7,  2.9],
+    'home':    [-156,  93,  97, 26,  -93, 94,  -95],
+    'pickup':    [-139,  91,  98, 34.5,  -48, 15,  -17],
+    'engage':  [-83,  91,  97,  59,  -100,  88.9,  38.2],  
+    'retract':  [-87,  91,  95,  63,  -100,  89,  28],  
+    # 'engage':  [-2.5,  30.3,  3.6,  53.3,  49.4,  2.2,  -48],  
+    # 'retract': [-2.5,  30.3,  3.6,  53.3,  49.4,  2.2,  -48],  
+}
+
+# RMS amplitude below which audio is considered silence and skipped (0–1 scale).
+# Typical speech RMS is 0.05–0.2; background noise is usually under 0.01.
+LOUDNESS_THRESHOLD = 0.05
+
+# Step sizes for each magnitude qualifier (mm)
+STEP = {
+    'little':  5,
+    'normal': 20,
+    'more':   40,
+    'lot':    80,
+}
+
+# Words that trigger each magnitude level
+LITTLE_WORDS  = {'little', 'slightly', 'small', 'tiny', 'bit'}
+MORE_WORDS    = {'more', 'further', 'farther', 'extra'}
+LOT_WORDS     = {'lot', 'much', 'way', 'far', 'big', 'large', 'huge'}
+
+# Maps direction keyword → unit vector (dx, dy, dz) and display label
 DIRECTION_MAP = {
-    'forward':  ( STEP_MM,       0,       0, 'Forward  +X'),
-    'backward': (-STEP_MM,       0,       0, 'Backward −X'),
-    'back':     (-STEP_MM,       0,       0, 'Backward −X'),
-    'left':     (      0,  STEP_MM,       0, 'Left     +Y'),
-    'right':    (      0, -STEP_MM,       0, 'Right    −Y'),
-    'up':       (      0,       0,  STEP_MM, 'Up       +Z'),
-    'down':     (      0,       0, -STEP_MM, 'Down     −Z'),
+    'forward':  ( 1,  0,  0, 'Forward  +X'),
+    'backward': (-1,  0,  0, 'Backward −X'),
+    'back':     (-1,  0,  0, 'Backward −X'),
+    'left':     ( 0,  1,  0, 'Left     +Y'),
+    'right':    ( 0, -1,  0, 'Right    −Y'),
+    'up':       ( 0,  0,  1, 'Up       +Z'),
+    'down':     ( 0,  0, -1, 'Down     −Z'),
 }
 
 
 def _read_ip_from_conf():
+    """Read the robot IP from example/wrapper/robot.conf, returning '' on failure."""
     conf_path = os.path.join(os.path.dirname(__file__), '../example/wrapper/robot.conf')
     try:
         parser = configparser.ConfigParser()
@@ -79,23 +269,61 @@ def _read_sim_mode():
         return 'mock'
 
 
+def _detect_magnitude(words):
+    """Return the step size (mm) based on qualifier words in the utterance."""
+    if words & LOT_WORDS:
+        return STEP['lot']
+    if words & MORE_WORDS:
+        return STEP['more']
+    if words & LITTLE_WORDS:
+        return STEP['little']
+    return STEP['normal']
+
+
+def _tokenize(text):
+    """Lowercase and strip punctuation, return a set of words."""
+    return set(re.sub(r'[^\w\s]', '', text.lower()).split())
+
+
 def parse_command(text):
     """
+    Parses natural-language commands with optional magnitude qualifiers.
+
     Returns one of:
-      ('move', dx, dy, dz, label)
+      ('move', dx, dy, dz, label)  — scaled by detected magnitude
       ('home', label)
       ('stop', label)
+      ('gripper_open', label)
+      ('gripper_close', label)
       None
     """
-    text = text.lower().strip()
+    words = _tokenize(text)
 
-    if 'stop' in text:
+    if 'stop' in words:
         return ('stop', 'Emergency Stop')
-    if 'home' in text:
+    # Require the exact adjacent phrase to avoid hallucinated single words
+    cleaned = re.sub(r'[^\w\s]', '', text.lower())
+    if 'go home' in cleaned:
         return ('home', 'Go Home')
+    if 'pickup' in words or 'pick up' in cleaned:
+        return ('pickup', 'Go to Pickup')
+    if 'engage' in words:
+        return ('engage', 'Go to Engage')
+    if 'retract' in words:
+        return ('retract', 'Go to Retract')
+    if 'open' in words:
+        return ('gripper_open', 'Open Gripper')
+    if 'close' in words:
+        return ('gripper_close', 'Close Gripper')
 
-    for word, (dx, dy, dz, label) in DIRECTION_MAP.items():
-        if word in text:
+    for keyword, (ux, uy, uz, base_label) in DIRECTION_MAP.items():
+        if keyword in words:
+            step = _detect_magnitude(words)
+            dx, dy, dz = ux * step, uy * step, uz * step
+            mag_names = {STEP['little']: 'a little', STEP['normal']: '',
+                         STEP['more']: 'more', STEP['lot']: 'a lot'}
+            qualifier = mag_names.get(step, '')
+            label = f"{base_label}  {qualifier}({step} mm)".strip()
             return ('move', dx, dy, dz, label)
 
     return None
@@ -113,30 +341,43 @@ def _cmd_label(cmd):
 def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
     """
     Captures mic audio, recognises speech, and enqueues parsed commands.
-    Tries Whisper first; falls back to Google Speech Recognition on error.
+
+    Uses faster-whisper (CTranslate2 + INT8) which is 4–8× faster than
+    openai-whisper on CPU. Key optimisations:
+      - INT8 quantised tiny.en model (English-only, no language detection step)
+      - beam_size=1 (greedy decode — single pass, no beam search overhead)
+      - built-in VAD filter skips silent chunks before they reach the model
+      - RMS loudness gate rejects quiet frames before any model work
+
+    Install: pip install faster-whisper
+
     Calls on_mic_state(str) to update the mic indicator.
     Calls on_heard(raw_text, cmd_or_None) for every recognition result.
     """
-    r = sr.Recognizer()
-    r.pause_threshold = 0.3
-    r.phrase_threshold = 0.1
-    r.non_speaking_duration = 0.2
-
-    # Check if Whisper is available (try to import it)
-    use_whisper = True
     try:
-        import whisper
-        # Try to initialize it to catch ctypes errors early (Windows issue)
-        _ = whisper.__version__
-    except Exception as e:
-        on_mic_state(f"Whisper unavailable: {e} — using Google Speech Recognition")
-        use_whisper = False
+        from faster_whisper import WhisperModel
+    except ImportError:
+        on_mic_state("ERROR: run  pip install faster-whisper")
+        return
+
+    on_mic_state("Loading Whisper model…")
+    # int8 quantisation cuts memory and inference time ~2× on CPU
+    whisper_model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+
+    r = sr.Recognizer()
+    r.pause_threshold = 0.4
+    r.phrase_threshold = 0.1
+    r.non_speaking_duration = 0.3
 
     try:
         mic = sr.Microphone()
     except Exception as e:
         on_mic_state(f"Mic error: {e}")
         return
+
+    _PROMPT = ("move forward a little, move backward more, move left a lot, "
+               "move right slightly, move up, move down, go home, pickup, engage, retract, "
+               "stop, open, close")
 
     with mic as source:
         on_mic_state("Calibrating microphone…")
@@ -145,7 +386,7 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
 
         while not stop_event.is_set():
             try:
-                audio = r.listen(source, timeout=3, phrase_time_limit=2)
+                audio = r.listen(source, timeout=3, phrase_time_limit=1.5)
             except sr.WaitTimeoutError:
                 on_mic_state("● Listening…")
                 continue
@@ -157,33 +398,33 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
 
             text = None
             try:
-                if use_whisper:
-                    try:
-                        text = r.recognize_whisper(
-                            audio, model="small", language="english",
-                            initial_prompt="move forward, move backward, move left, move right, move up, move down, go home, stop",
-                            no_speech_threshold=0.6,
-                            fp16=False,
-                        ).lower()
-                    except (TypeError, AttributeError, ImportError):
-                        # Whisper load failed (common on Windows), switch to Google
-                        on_mic_state("● Processing (Google)…")
-                        text = r.recognize_google(audio, language="en-US").lower()
-                else:
-                    # Whisper not available, use Google
-                    text = r.recognize_google(audio, language="en-US").lower()
+                # Decode WAV bytes → float32 numpy array at 16 kHz mono
+                wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
+                audio_array = np.frombuffer(wav_bytes[44:], dtype=np.int16).astype(np.float32) / 32768.0
 
-            except sr.UnknownValueError:
+                # RMS loudness gate — skip before touching the model
+                if np.sqrt(np.mean(audio_array ** 2)) < LOUDNESS_THRESHOLD:
+                    on_mic_state("● Listening…")
+                    continue
+
+                # beam_size=1 → greedy decoding (single decode pass, no beam search)
+                # vad_filter → faster-whisper skips internal silent segments
+                segments, _ = whisper_model.transcribe(
+                    audio_array,
+                    language="en",
+                    initial_prompt=_PROMPT,
+                    beam_size=1,
+                    vad_filter=True,
+                )
+                text = " ".join(s.text for s in segments).lower().strip()
+            except Exception as e:
+                on_mic_state("● Listening…")
+                on_heard(f"(error: {e})", None)
+                continue
+
+            if not text:
                 on_mic_state("● Listening…")
                 on_heard("(unclear)", None)
-                continue
-            except sr.RequestError as e:
-                on_mic_state(f"API error: {e}")
-                on_heard("(api error)", None)
-                continue
-            except Exception as e:
-                on_mic_state(f"Recognition error: {e}")
-                on_heard("(error)", None)
                 continue
 
             if text:
@@ -198,10 +439,15 @@ def listen_loop(cmd_queue, stop_event, on_mic_state, on_heard):
     on_mic_state("Stopped")
 
 
-def execute_loop(arm, cmd_queue, stop_event, on_active, on_done, on_log, robot=None, dispatcher=None):
+def execute_loop(arm, gripper, cmd_queue, stop_event, on_active, on_done, on_log, robot=None, dispatcher=None):
     """
-    Drains cmd_queue and executes each command on the arm.
-    If arm is None but robot/dispatcher are provided (demo mode), uses simulation.
+    Drains cmd_queue and executes each command on the arm, gripper, or simulation robot.
+    Supports three execution modes:
+      - Real arm: if arm is not None
+      - Simulation: if robot and dispatcher are not None
+      - Gripper-only: if gripper is not None but arm is None
+      - Demo: if all are None
+
     Calls on_active(label) when a command starts, on_done() when it finishes.
 
     Supports two command formats:
@@ -235,17 +481,33 @@ def execute_loop(arm, cmd_queue, stop_event, on_active, on_done, on_log, robot=N
             label = _cmd_label(cmd)
             on_active(label)
 
-            if arm is None and robot is None:
-                on_log(f"[DEMO] Would execute: {label}")
-                import time; time.sleep(0.4)
+            is_gripper_cmd = cmd[0] in ('gripper_open', 'gripper_close')
+
+            if is_gripper_cmd:
+                # Handle gripper commands
+                if gripper is None:
+                    on_log(f"[DEMO] Would execute: {label}")
+                    import time; time.sleep(0.4)
+                else:
+                    on_log(f"Executing: {label}")
+                    try:
+                        if cmd[0] == 'gripper_open':
+                            gripper.open()
+                        elif cmd[0] == 'gripper_close':
+                            gripper.close()
+                    except Exception as e:
+                        on_log(f"Gripper error during '{label}': {e}")
             elif arm is not None:
                 # Use physical arm
                 on_log(f"Executing: {label}")
                 try:
                     if cmd[0] == 'stop':
                         arm.emergency_stop()
-                    elif cmd[0] == 'home':
-                        arm.move_gohome(wait=True)
+                    elif cmd[0] in ('home', 'pickup', 'engage', 'retract'):
+                        arm.set_servo_angle(
+                            angle=JOINT_POSITIONS[cmd[0]],
+                            speed=30, wait=True,
+                        )
                     elif cmd[0] == 'move':
                         _, dx, dy, dz, _ = cmd
                         arm.set_position(
@@ -270,6 +532,10 @@ def execute_loop(arm, cmd_queue, stop_event, on_active, on_done, on_log, robot=N
                         robot.move_relative(dx=dx, dy=dy, dz=dz)
                 except Exception as e:
                     on_log(f"Robot error during '{label}': {e}")
+            else:
+                # Demo mode
+                on_log(f"[DEMO] Would execute: {label}")
+                import time; time.sleep(0.4)
 
         cmd_queue.task_done()
         on_done()
@@ -301,11 +567,12 @@ C = {
 
 
 def _btn(parent, text, cmd, color, color_dk, state='normal', width=14, big=False):
-    """Flat-style button with hover effect."""
+    """Flat-style button with hover effect. Text is near-black to contrast with
+    the coloured button background."""
     fsize = 13 if big else 11
     b = tk.Button(
         parent, text=text, command=cmd,
-        bg=color, fg=C['text'], activebackground=color_dk, activeforeground=C['text'],
+        bg=color, fg='#111111', activebackground=color_dk, activeforeground='#111111',
         font=('Helvetica', fsize, 'bold'), width=width,
         relief='flat', bd=0, padx=12, pady=8,
         cursor='hand2', state=state,
@@ -331,7 +598,20 @@ def _section(parent, title):
 # ---------------------------------------------------------------------------
 
 class VoiceControlApp:
+    """
+    Tkinter GUI that connects to an xArm, listens for voice commands via
+    Whisper, and executes Cartesian movements in real time.
+
+    The app runs two daemon threads while listening is active:
+      - listen_loop  — records audio and enqueues parsed commands
+      - execute_loop — drains the queue and sends commands to the arm
+
+    All GUI updates from those threads are posted via root.after() to stay
+    on the main thread.
+    """
+
     def __init__(self, root):
+        """Initialise state and build the UI."""
         self.root = root
         self.root.title("xArm Voice Control")
         self.root.resizable(True, True)
@@ -339,6 +619,7 @@ class VoiceControlApp:
         self.root.minsize(700, 700)
 
         self.arm = None
+        self.gripper = None
         self._session_active = False  # True when connected or in demo mode
         self.stop_event = threading.Event()
         self.voice_thread = None
@@ -350,13 +631,53 @@ class VoiceControlApp:
         self.dispatcher = None
         self.sim_mode = _read_sim_mode()
 
+        # Attempt to connect to the DexHand gripper at startup
+        try:
+            self.gripper = GripperController()
+        except Exception as e:
+            self.gripper = None
+            # Will log after UI is built; store message for later
+            self._gripper_init_error = str(e)
+        else:
+            self._gripper_init_error = None
+
         self._build_ui()
 
     # --- UI construction ---------------------------------------------------
 
     def _build_ui(self):
+        """Construct all widgets: menubar, header, connection panel, voice controls,
+        live status, and activity log/queue."""
         W = self.root
         P = {'padx': 16}
+
+        # ── Menubar ─────────────────────────────────────────────────────────
+        menubar = tk.Menu(W, bg=C['surface'], fg=C['text'],
+                          activebackground='#C41230', activeforeground=C['text'],
+                          relief='flat', bd=0)
+        cmd_menu = tk.Menu(menubar, tearoff=0,
+                           bg=C['surface'], fg=C['text'],
+                           activebackground='#C41230', activeforeground=C['text'],
+                           relief='flat', bd=0, font=('Courier', 12))
+        cmd_menu.add_command(label='Qualifiers:  (none) = 20 mm  |  a little = 5 mm  |  more = 40 mm  |  a lot = 80 mm', state='disabled')
+        cmd_menu.add_separator()
+        cmd_menu.add_command(label='"forward [qualifier]"   →  +X', state='disabled')
+        cmd_menu.add_command(label='"backward [qualifier]"  →  -X', state='disabled')
+        cmd_menu.add_command(label='"left [qualifier]"      →  +Y', state='disabled')
+        cmd_menu.add_command(label='"right [qualifier]"     →  -Y', state='disabled')
+        cmd_menu.add_command(label='"up [qualifier]"        →  +Z', state='disabled')
+        cmd_menu.add_command(label='"down [qualifier]"      →  -Z', state='disabled')
+        cmd_menu.add_separator()
+        cmd_menu.add_command(label='"go home"               →  return to home position', state='disabled')
+        cmd_menu.add_command(label='"pickup"                →  move to pickup position', state='disabled')
+        cmd_menu.add_command(label='"engage"                →  move to engage position', state='disabled')
+        cmd_menu.add_command(label='"retract"               →  move to retract position', state='disabled')
+        cmd_menu.add_command(label='"stop"                  →  emergency stop',          state='disabled')
+        cmd_menu.add_separator()
+        cmd_menu.add_command(label='"open"                  →  open DexHand gripper',   state='disabled')
+        cmd_menu.add_command(label='"close"                 →  close DexHand gripper',  state='disabled')
+        menubar.add_cascade(label='Commands', menu=cmd_menu)
+        W.config(menu=menubar)
 
         # ── Header ──────────────────────────────────────────────────────────
         hdr = tk.Frame(W, bg='#C41230', pady=16)
@@ -494,11 +815,19 @@ class VoiceControlApp:
         ref_out.pack(fill='x', pady=(0, 16), **P)
 
         commands = [
-            ('forward / backward', f'±X  ({STEP_MM} mm)'),
-            ('left / right',       f'±Y  ({STEP_MM} mm)'),
-            ('up / down',          f'±Z  ({STEP_MM} mm)'),
-            ('go home',            'return to home position'),
-            ('stop',               'emergency stop'),
+            ('forward [qualifier]',  '±X  (5 / 20 / 40 / 80 mm)'),
+            ('backward [qualifier]', '±X  (5 / 20 / 40 / 80 mm)'),
+            ('left [qualifier]',     '±Y  (5 / 20 / 40 / 80 mm)'),
+            ('right [qualifier]',    '±Y  (5 / 20 / 40 / 80 mm)'),
+            ('up [qualifier]',       '±Z  (5 / 20 / 40 / 80 mm)'),
+            ('down [qualifier]',     '±Z  (5 / 20 / 40 / 80 mm)'),
+            ('go home',              'move to home position'),
+            ('pickup',               'move to pickup position'),
+            ('engage',               'move to engage position'),
+            ('retract',              'move to retract position'),
+            ('stop',                 'emergency stop'),
+            ('open',                 'open DexHand gripper'),
+            ('close',                'close DexHand gripper'),
         ]
         ref_grid = tk.Frame(ref_in, bg=C['surface'])
         ref_grid.pack(fill='x', padx=12, pady=10)
@@ -514,12 +843,25 @@ class VoiceControlApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # Report gripper connection status once UI is ready
+        self.root.after(
+            100,
+            lambda: (
+                self._log("Gripper connected on " + ".")
+                if self.gripper is not None
+                else self._log(f"Gripper not connected: {self._gripper_init_error}")
+            ),
+        )
+
     # --- Thread-safe GUI updates -------------------------------------------
 
     def _set_mic_state(self, text):
+        """Thread-safe update of the mic status label."""
         self.root.after(0, lambda: self.mic_var.set(text))
 
     def _set_heard(self, raw_text, cmd):
+        """Thread-safe update of the 'Heard' label. Shows green on a recognised
+        command and red on an unrecognised one."""
         def _update():
             if cmd is None:
                 self.heard_var.set(f'"{raw_text}"   ✗ unrecognised')
@@ -530,6 +872,8 @@ class VoiceControlApp:
         self.root.after(0, _update)
 
     def _set_active(self, label):
+        """Thread-safe update of the 'Active' command badge with colour coding:
+        grey for idle, dark-red for stop, blue-dark for home, green-dark for moves."""
         def _update():
             self.active_var.set(label)
             if label == '—':
@@ -558,6 +902,7 @@ class VoiceControlApp:
         self.root.after(0, _update)
 
     def _log(self, msg):
+        """Thread-safe append of a message to the scrolling history log."""
         def _append():
             self.status_log.config(state='normal')
             self.status_log.insert('end', msg + '\n')
@@ -568,6 +913,8 @@ class VoiceControlApp:
     # --- on_heard callback (called from listen thread) ---------------------
 
     def _on_heard(self, raw_text, cmd):
+        """Callback from listen_loop. Updates the heard label, logs the result,
+        and adds the command to the queue display if recognised."""
         self._set_heard(raw_text, cmd)
         if cmd is not None:
             self._log(f'Queued: {_cmd_label(cmd)}  ("{raw_text}")')
@@ -578,22 +925,35 @@ class VoiceControlApp:
     # --- Button callbacks --------------------------------------------------
 
     def _on_demo(self):
-        """Start in demo mode — uses simulation robot based on surgical.conf."""
+        """Start in demo mode — uses simulation robot or gripper-only mode."""
         self.arm = None
         self._session_active = True
 
-        # Initialize simulation robot and dispatcher
-        try:
-            self.robot = get_robot('../surgical.conf')
-            self.dispatcher = CommandDispatcher(robot=self.robot)
-            self._log(f"Demo mode — using {self.sim_mode} simulation, no physical robot.")
-        except Exception as e:
-            self._log(f"Failed to initialize simulation: {e}")
+        # Try to initialize simulation robot and dispatcher first
+        if _SIMULATION_AVAILABLE:
+            try:
+                self.robot = get_robot('../surgical.conf')
+                self.dispatcher = CommandDispatcher(robot=self.robot)
+                self._log(f"Demo mode — using {self.sim_mode} simulation, no physical robot.")
+                self.status_badge.config(text="  SIM  ", bg='#5a5a5a')
+            except Exception as e:
+                self._log(f"Failed to initialize simulation: {e}")
+                self.robot = None
+                self.dispatcher = None
+                # Fall through to gripper-only mode
+        else:
             self.robot = None
             self.dispatcher = None
-            self._log("Demo mode — commands will be logged only.")
 
-        self.status_badge.config(text="  DEMO  ", bg='#5a5a5a')
+        # If no simulation, try gripper-only mode
+        if self.robot is None:
+            if self.gripper is not None:
+                self._log("Gripper-only mode — gripper is live, arm commands will be simulated.")
+                self.status_badge.config(text="  GRIPPER ONLY  ", bg='#8f0d22')
+            else:
+                self._log("Demo mode — commands will be simulated, no robot connected.")
+                self.status_badge.config(text="  DEMO  ", bg='#5a5a5a')
+
         self.btn_connect.config(state='disabled')
         self.btn_demo.config(state='disabled')
         self.btn_disconnect.config(state='normal', bg=C['grey'])
@@ -601,6 +961,8 @@ class VoiceControlApp:
         self.btn_estop.config(state='normal', bg=C['red'])
 
     def _on_connect(self):
+        """Connect to the robot at the entered IP, enable motion, and set
+        position-control mode. Updates button states on success or failure."""
         ip = self.ip_var.get().strip()
         if not ip:
             self._log("ERROR: Enter a robot IP address.")
@@ -618,15 +980,23 @@ class VoiceControlApp:
         except Exception as e:
             self._log(f"Connection failed: {e}")
             self.arm = None
+            if self.gripper is not None:
+                self._log("Arm unavailable — falling back to gripper-only mode.")
+                self._on_demo()
             return
 
         self.btn_connect.config(state='disabled')
         self.btn_disconnect.config(state='normal', bg=C['grey'])
         self.btn_start.config(state='normal', bg=C['blue'])
         self.btn_estop.config(state='normal', bg=C['red'])
-        self.status_badge.config(text="  LIVE  ", bg='#8f0d22')
+        if self.gripper is not None:
+            self.status_badge.config(text="  LIVE  ", bg='#8f0d22')
+        else:
+            self.status_badge.config(text="  ARM ONLY  ", bg='#8f0d22')
 
     def _on_disconnect(self):
+        """Stop listening, disconnect the arm, and reset all buttons to their
+        disconnected state."""
         self._on_stop_listening()
         if self.arm:
             self.arm.disconnect()
@@ -645,6 +1015,8 @@ class VoiceControlApp:
         self.btn_estop.config(state='disabled', bg=C['red_dk'])
 
     def _on_start(self):
+        """Clear any stale queue, then launch the listen and execute daemon
+        threads. No-ops if a listen session is already running."""
         if self.voice_thread and self.voice_thread.is_alive():
             return
         # Clear stale queue display
@@ -665,7 +1037,7 @@ class VoiceControlApp:
         )
         self.exec_thread = threading.Thread(
             target=execute_loop,
-            args=(self.arm, self.cmd_queue, self.stop_event,
+            args=(self.arm, self.gripper, self.cmd_queue, self.stop_event,
                   self._set_active, self._on_cmd_done, self._log,
                   self.robot, self.dispatcher),
             daemon=True,
@@ -678,6 +1050,7 @@ class VoiceControlApp:
         self._log("Voice listener started.")
 
     def _on_stop_listening(self):
+        """Signal both daemon threads to stop via the shared stop_event."""
         self.stop_event.set()
         self.btn_start.config(state='normal' if self._session_active else 'disabled')
         self.btn_stop_listen.config(state='disabled')
@@ -685,6 +1058,8 @@ class VoiceControlApp:
         self._log("Voice listener stopped.")
 
     def _on_estop(self):
+        """Send an immediate emergency stop to the arm (or simulate in demo mode),
+        then clear the pending command queue and display."""
         if self.arm:
             self.arm.emergency_stop()
             self._log("EMERGENCY STOP sent.")
@@ -699,10 +1074,15 @@ class VoiceControlApp:
                 break
 
     def _on_arm_error(self, item):
+        """Registered xArm error/warn callback — logs the error and warn codes."""
         self._log(f"Arm error/warn — code={item.get('error_code')} warn={item.get('warn_code')}")
 
     def _on_close(self):
+        """Window close handler — disconnect cleanly before destroying the window."""
         self._on_disconnect()
+        if self.gripper:
+            self.gripper.disconnect()
+            self.gripper = None
         self.root.destroy()
 
 

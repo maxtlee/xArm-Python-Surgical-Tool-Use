@@ -4,10 +4,14 @@
 xarm-python-sdk
 SpeechRecognition
 pyaudio
-
-# Simulation dependencies
+PyQt5
+pyserial
+pyyaml
+dynamixel_sdk
+soundfile
+faster-whisper
 numpy
 mujoco>=3.1.0
 mediapy
 meshcat
-xacro  
+xacro

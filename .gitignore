@@ -15,3 +15,6 @@ venv/
 urdf/
 surgical_test/__pycache__
 surgical_test/sim/__pycache__
+dexKit_control/NIBIB.log
+surgical.conf
+.DS_store
