@@ -1,8 +1,8 @@
-# xArm-Python-Surgical-Tool-Use
+# Dexkit-Surgical-Assistance
 
-Using the xArm and DexKit hands to operate as a tool-using and voice-commanded assistant for hand surgeons.
+Aims to use the xArm and DexKit hand as a tool-using and voice-commanded assistant for hand surgeons. Uses OpenAI Whisper for speech-to-text and performs basic keyword detection to set incremental or absolute setpoints to the xArm and DexKit hand. 
 
-Project funded by Carnegie Mellon Foam Robotics Lab and advised by Dr. Nancy Pollard.
+Project run by undergraduates in the Carnegie Mellon Foam Robotics Lab and advised by Dr. Nancy Pollard.
 
 Forked from https://github.com/xArm-Developer/xArm-Python-SDK.git
 
@@ -12,10 +12,19 @@ Forked from https://github.com/xArm-Developer/xArm-Python-SDK.git
 
 ```
 surgical_test/
-  voice-movement.py       # voice-controlled xArm GUI (main app)
+  voice-movement.py       # voice-controlled xArm GUI and demo script (main app)
   cv_aruco_test.py        # standalone CV test: ArUco marker detection + incision spot generation
   make_aruco_markers.py   # generate printable ArUco marker PNGs (run once)
   gripper_poses.yaml      # DexHand open/close pose definitions
+```
+
+## Branches
+
+```
+main                      # Working demo code
+vision                    # Experimental code testing localization using an Intel RealSense depth/RGB camera for ArUco marker detection
+deepgram                  # Experimental code testing API use for faster speech-to-text
+sim                       # Experimental code implementing a simulator in MuJoCo
 ```
 
 ---
